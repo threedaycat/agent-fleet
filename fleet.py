@@ -201,11 +201,16 @@ def awaiting_choice(pane: str) -> bool:
     检测特征直接抄 `desk_push.sh` 的 `desk_busy()`——那套在生产里跑了很久，
     同一套系统里 desk 那条注入路径早就防了这个，`fleet.py wake` 没防，
     没防的这条还是天天在用的那条，没有理由自己重新发明一遍。
+
+    只看 `capture_tail`（最后几行），不看整块可见区——2026-08-01 5380
+    实测过：原来 `capture-pane -p` 拿的是整块可见区，如果那块里有人
+    回显过 "Enter to select" 这几个字（比如自己在 grep 它们、或者这段
+    文字本来就是任务原文的一部分被打印在屏幕上），会被当成真的停在
+    选择框上，误拒正常派活。这条失败方向是安全的（拒发不是硬发），
+    但会莫名其妙挡掉本该正常放行的派活。
     """
-    if not pane or not pane.startswith("%"):
-        return False
-    code, out = sh(["tmux", "capture-pane", "-t", pane, "-p"])
-    if code != 0:
+    out = capture_tail(pane)
+    if not out:
         return False
     return bool(re.search(r"Enter to select|↑/↓ to navigate|Esc to cancel", out))
 
