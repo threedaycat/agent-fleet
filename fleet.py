@@ -167,6 +167,28 @@ def pending_input(pane: str) -> str:
     return " ".join(buf).strip()
 
 
+def capture_tail(pane: str, n: int = 6) -> str:
+    """只拿 pane 最后 n 行——不管当前可见区多高、滚动到哪，永远是"此刻
+    最新"这几行。
+
+    2026-08-01 5380 实测：`ctx_usage` 原来带 `-S -15` 往上翻 scrollback，
+    抓到过旧页脚（报 89k 实际 336k，报 658k 实际 126k）——拿这个字段
+    判断该不该催压缩，字段错了调度就是错的，是三个问题里最要紧那条。
+
+    **`-S` 的行号是相对可见区顶部数的，不是相对底部**——一开始想用
+    `-S -{n} -E -` 精确取尾部，结果 pane 矮的时候看着像只拿了尾部
+    （凑巧），pane 高的时候照样把整个可见区（实测一个 46 行高的 pane）
+    都带回来，验证时当场露馅。改成"整块可见区先原样拿回来，Python 这边
+    自己切最后 n 行"，就不受 pane 高度影响了。
+    """
+    if not pane or not pane.startswith("%"):
+        return ""
+    code, out = sh(["tmux", "capture-pane", "-t", pane, "-p"])
+    if code != 0:
+        return ""
+    return "\n".join(out.splitlines()[-n:])
+
+
 def awaiting_choice(pane: str) -> bool:
     """对面是不是正停在一个交互选择框上（AskUserQuestion 那种），不是在等文字输入。
 
@@ -194,16 +216,19 @@ def ctx_usage(pane: str):
     页脚格式参考：`[Opus 5 (1M context)] 项目名  ▓▓▓░░ 53% (529k)  ⚠⚠ /compact now`。
     解析不到就返回 None——**不猜、不报错**，页脚格式以后要是变了，这里
     应该老实说"不知道"，不该给一个可能是错的数字出去。
+
+    只看 `capture_tail`（最后几行），不带 `-S` 往上翻 scrollback——见
+    `capture_tail` 文档里 2026-08-01 那次"读到滚动区旧页脚"的实测
+    （报 89k 实际 336k，报 658k 实际 126k）。就算尾部里凑巧出现不止
+    一个百分比，取最后一个匹配——那个才是离当前最近的。
     """
-    if not pane or not pane.startswith("%"):
+    out = capture_tail(pane)
+    if not out:
         return None
-    code, out = sh(["tmux", "capture-pane", "-t", pane, "-p", "-S", "-15"])
-    if code != 0:
+    matches = re.findall(r"(\d+)%\s*\((\d+k)\)", out)
+    if not matches:
         return None
-    m = re.search(r"(\d+)%\s*\((\d+k)\)", out)
-    if not m:
-        return None
-    pct, kk = m.group(1), m.group(2)
+    pct, kk = matches[-1]
     return f"{kk} ({pct}%)"
 
 
