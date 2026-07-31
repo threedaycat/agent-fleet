@@ -210,6 +210,34 @@ def sessions(include_remembered: bool = True) -> dict:
     if not include_remembered:
         return out
 
+    # 第三层：sidecar 记的 last_seen —— 状态文件缩水时靠它把会话认回来，
+    # 再用 tmux 那份真相（panes）验证那个 pane 还在不在。
+    # **这段曾经因为下面第四层末尾提前 return 而变成死代码，从没生效过**
+    # （2026-07-31 发现，见 fix commit）：受影响的会话统统被第四层接管，
+    # 第四层不给 pane、也分不出「pane 还在」和「pane 真关了」，
+    # 于是它们要么在 `fleet.py list` 上被标成看着能唤醒的「idle」
+    # （实际那个 pane 早就没了，`wake` 会莫名其妙地报"pane 不在了"），
+    # 要么该显示"关了"却显示成"闲着"，糊弄看板的人。
+    # 顺序很重要：这层必须跑在第四层前面，抢到的 sid 第四层会跳过。
+    for sid, sc in side.items():
+        if sid in out:
+            continue
+        ls = sc.get("last_seen") or {}
+        pane = ls.get("pane", "")
+        if not pane:
+            continue
+        alive = pane in panes
+        out[sid] = {
+            "sid": sid, "pane": pane, "tmux": ls.get("tmux", ""),
+            "window_name": ls.get("window_name", ""), "cwd": ls.get("cwd", ""),
+            "state": "unknown" if alive else "closed",
+            "raw_status": "", "age": 10 ** 6,
+            "project": project_of(ls.get("cwd", "")) or sc.get("project", ""),
+            "note": sc.get("note", ""), "last_wake": sc.get("last_wake", ""),
+            "known": "remembered" if alive else "gone",
+            "last_seen_at": ls.get("at", ""),
+        }
+
     # 第四层：transcript 的 mtime。状态文件缩水、又没有 last_seen 时，
     # 「这个会话的 transcript 刚刚还在写」就是它活着的铁证 ——
     # 有个会话被报成「查不到」，实际它 94 秒前还在写盘。
@@ -235,27 +263,6 @@ def sessions(include_remembered: bool = True) -> dict:
             "project": sc.get("project") or "",
             "note": sc.get("note", ""), "last_wake": sc.get("last_wake", ""),
             "known": "transcript",
-        }
-    return out
-
-    # 状态文件里没有、但 pane 还在的 —— 它没关，只是最近没活动
-    for sid, sc in side.items():
-        if sid in out:
-            continue
-        ls = sc.get("last_seen") or {}
-        pane = ls.get("pane", "")
-        if not pane:
-            continue
-        alive = pane in panes
-        out[sid] = {
-            "sid": sid, "pane": pane, "tmux": ls.get("tmux", ""),
-            "window_name": ls.get("window_name", ""), "cwd": ls.get("cwd", ""),
-            "state": "unknown" if alive else "closed",
-            "raw_status": "", "age": 10 ** 6,
-            "project": project_of(ls.get("cwd", "")) or sc.get("project", ""),
-            "note": sc.get("note", ""), "last_wake": sc.get("last_wake", ""),
-            "known": "remembered" if alive else "gone",
-            "last_seen_at": ls.get("at", ""),
         }
     return out
 
