@@ -297,7 +297,7 @@ wake 留给**需要那个会话已有上下文**的活。
 ## 已知边界
 
 - 采集器已经交给 **launchd 托管**（`<label-prefix>.at` / `.poll`，前缀在 `run.sh` 顶部，
-  默认 `local.dtwatch`；plist 在 `~/Library/LaunchAgents/`）：开机自启，进程挂了自动拉回来。
+  默认 `com.workos.dtwatch`；plist 在 `~/Library/LaunchAgents/`）：开机自启，进程挂了自动拉回来。
   `./run.sh install [间隔秒]` 装，`./run.sh uninstall` 卸。
   装了 launchd 之后就别再用 `run.sh start`，会跑两份、抢同一个游标文件。
 - **Claude 这侧的定时巡检（cron）只活在当前这个 Claude 会话里**，会话一关就没了，
