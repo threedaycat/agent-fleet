@@ -1,0 +1,133 @@
+{
+ "self": {
+  "name": "你的钉钉显示名",
+  "aliases": [
+   "你的全名",
+   "同事平时叫你的简称",
+   "YourName",
+   "yourname"
+  ],
+  "open_dingtalk_id": "<你自己的 openDingTalkId，用 dws contact 查>",
+  "user_id": "<你自己的 userId>"
+ },
+ "poll": {
+  "scan_top_n": 22,
+  "extend_step": 10,
+  "max_scan": 60,
+  "max_pages_per_conv": 6,
+  "page_limit": 50,
+  "new_conv_lookback_hours": 6
+ },
+
+ "_comment_groups": "下面几组全部填**你自己的**真实会话名（跟钉钉里显示的一字不差）。这个文件是模板，不要把真实群名提交回版本库。",
+
+ "groups_always_watch": [
+  "需求-项目A",
+  "需求-项目B",
+  "某某小组群",
+  "某公司全员群",
+  "某技术主线群",
+  "监控：某某构建发布"
+ ],
+ "mute_conversations": [
+  "钉钉运动",
+  "新的好友",
+  "钉钉小秘书",
+  "钉钉电话",
+  "某公司的全员话题圈"
+ ],
+ "low_priority_conversations": [
+  "监控：某某构建发布",
+  "工作通知:某公司",
+  "某公司全员群"
+ ],
+ "priority_keywords": [
+  "排期",
+  "截止",
+  "deadline",
+  "ddl",
+  "今天",
+  "明天",
+  "阻塞",
+  "卡住",
+  "上线",
+  "发布",
+  "评审",
+  "验收",
+  "提测",
+  "冒烟",
+  "日报",
+  "周报",
+  "补交",
+  "催办",
+  "合规",
+  "紧急",
+  "尽快",
+  "麻烦",
+  "帮忙",
+  "帮我",
+  "确认一下",
+  "什么时候",
+  "能不能",
+  "看下",
+  "看一下",
+  "回复",
+  "答复",
+  "拉个会",
+  "会议",
+  "对齐"
+ ],
+
+ "_comment_senders": "谁发的消息一律算高优先级。填真名，跟钉钉显示名一致。",
+ "priority_senders": [
+  "同事A",
+  "同事B",
+  "某产品",
+  "某后端",
+  "某设计",
+  "直属上级"
+ ],
+ "bot_senders": [
+  "某机器人",
+  "某需求排期机器人",
+  "某公司工作通知"
+ ],
+
+ "cc": {
+  "broadcast_on_stop": true,
+  "stop_wait_seconds": 0,
+  "remote_wait_seconds": 600,
+  "default_remote_minutes": 90,
+  "poll_interval": 6,
+  "broadcast_max_chars": 700,
+  "notify_always": false,
+  "main_session": "<总控那个 Claude 会话的 session id；手机上 /xxx 开头的命令固定发给它>"
+ },
+ "reminder": {
+  "channel": "self_dm",
+  "quiet_start": "22:30",
+  "quiet_end": "08:30",
+  "min_interval_minutes": 45,
+  "auto_at_me": true,
+  "urgent_ignore_quiet": true
+ },
+ "route": {
+  "某个只谈一个项目的同事名": {
+   "session": "<那个项目 Claude 会话的 session id，/status 里看>",
+   "label": "项目短名"
+  },
+  "某个项目群名": {
+   "session": "<同上>",
+   "label": "项目短名"
+  }
+ },
+ "picker": {
+  "stuck_after_seconds": 900
+ },
+ "fleet": {
+  "projects": {
+   "~/work/项目A目录": "项目A（署名和 fleet list 用这个短名，不是目录名）",
+   "~/work/dingtalk-watch": "dtwatch"
+  }
+ }
+}

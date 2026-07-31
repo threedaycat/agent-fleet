@@ -1,0 +1,24 @@
+# data/ 整个不进版本库 —— 里面全是本机的私人内容：
+#   inbox.ndjson  所有采集到的私聊和群消息原文
+#   tasks.md      同事发来的各种私事，可能含账号、人事、工时这类不该外传的内容
+#   docs/         为看懂上下文下载的文档和会议听记
+#   cc/, *.log    遥控通道日志、会话状态、游标
+# 想留个空目录占位就把 data/.gitkeep 单独放出来。
+data/
+
+# 本机配置：带自己的 open_dingtalk_id / user_id 和各会话的 session id。
+# 结构看 config.example.json。
+config.json
+
+# _local-* 是「只属于这台机器/这个人」的那一份：真实的巡检口径、联系人、团队规矩。
+# 仓库里对应的通用模板照常提交（例如 TRIAGE.md），本地版覆盖它。
+_local-*
+
+__pycache__/
+*.pyc
+*.bak
+*.bak-*
+.DS_Store
+
+# 临时/试验用的散落文件
+who

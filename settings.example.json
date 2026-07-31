@@ -1,0 +1,49 @@
+{
+  "_readme": [
+    "Claude Code 的 hook 配置模板 —— 这套遥控/编排的入口就在这两个 hook 上。",
+    "把下面 hooks 段合并进你自己的 ~/.claude/settings.json（或项目内的 .claude/settings.json）。",
+    "把 <REPO> 换成本仓库在你机器上的绝对路径，别用 ~ （hook 的命令不一定过 shell 展开）。",
+    "这个文件里不含任何真实路径、id 或凭据，可以直接进版本库。",
+    "以 _ 开头的键只是注释，Claude Code 会忽略；抄进 settings.json 时可以整段删掉。"
+  ],
+
+  "_hook_notes": {
+    "Stop": [
+      "会话每轮活干完时调用。它干三件事：报心跳（fleet.beat）、把这一轮说了什么播报到手机、",
+      "看有没有新指令或按 route 表派给本会话的消息。",
+      "有活 → 输出 {\"decision\":\"block\",\"reason\":\"<那条指令>\"}，会话带着它接着干；没有 → 放它停。",
+      "timeout 必须显式写，且要比 config.json 的 cc.remote_wait_seconds 大一点 ——",
+      "hook 默认 timeout 只有 60 秒，遥控窗口开着时这个 hook 会挂着等最长 remote_wait_seconds。"
+    ],
+    "Notification": [
+      "要授权、或空等输入超过 60 秒时捅一下手机。短命令，给 30 秒够了。"
+    ]
+  },
+
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 <REPO>/dtcc.py hook-stop",
+            "timeout": 640
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 <REPO>/dtcc.py hook-notify",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
