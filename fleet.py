@@ -167,6 +167,27 @@ def pending_input(pane: str) -> str:
     return " ".join(buf).strip()
 
 
+def awaiting_choice(pane: str) -> bool:
+    """对面是不是正停在一个交互选择框上（AskUserQuestion 那种），不是在等文字输入。
+
+    2026-08-01 5380 指出：这跟 `pending_input` 防的不是一回事——那个防的是
+    "输入框有字没提交"，这个防的是"根本不在输入框，Claude 正等你在选择框
+    里按键"。硬发文字进去会被当成对选择框的按键响应，可能替他确认了一件
+    本该他自己点头的事（发消息确认、权限确认、危险命令确认——机主的硬
+    规矩正是这些必须他本人点头）。这不是体验问题，是会踩红线的坑。
+
+    检测特征直接抄 `desk_push.sh` 的 `desk_busy()`——那套在生产里跑了很久，
+    同一套系统里 desk 那条注入路径早就防了这个，`fleet.py wake` 没防，
+    没防的这条还是天天在用的那条，没有理由自己重新发明一遍。
+    """
+    if not pane or not pane.startswith("%"):
+        return False
+    code, out = sh(["tmux", "capture-pane", "-t", pane, "-p"])
+    if code != 0:
+        return False
+    return bool(re.search(r"Enter to select|↑/↓ to navigate|Esc to cancel", out))
+
+
 def ctx_usage(pane: str):
     """从页脚那行解析上下文占用，形如 "529k (53%)"。
 
@@ -1004,6 +1025,21 @@ def cmd_wake(args):
                           "error": "它正在跑，现在打字会打断它；真要插队加 --force"},
                          ensure_ascii=False))
         return 1
+    choice_override = False
+    if awaiting_choice(pane):
+        # 护栏三：对面停在交互选择框上，硬发文字会被当成按键响应，
+        # 可能替他确认了一件本该他自己点头的事——这是红线,不是体验问题,
+        # 所以放在 pending_input 前面单独判、单独报,状态值也跟它区分开。
+        if not args.force:
+            print(json.dumps({"ok": False, "target": disp_of(rec),
+                              "state": "awaiting-choice",
+                              "error": "对面停在一个交互选择框上（Enter to select / "
+                                       "↑↓ 导航 / Esc 取消），硬发文字会被当成对这个"
+                                       "选择框的按键响应，可能替他确认了本该他自己"
+                                       "点头的操作；确认要覆盖加 --force"},
+                             ensure_ascii=False))
+            return 1
+        choice_override = True
     pending = pending_input(pane)
     if pending and not args.force:
         # 护栏一：输入框里排着没提交的东西（尤其 /compact）就别再往里塞字了——
@@ -1040,8 +1076,14 @@ def cmd_wake(args):
     # 护栏二：把这次派活时目标会话的上下文占用亮出来，派活的人一眼就能看见
     # "这个会话快满了"，不用等它交活才发现——2026-07-31 晚上主会话派活前
     # 从来不看对方上下文，直接给 529k 的会话又派了新活。
-    print(json.dumps({"ok": True, "target": disp_of(rec), "pane": pane,
-                      "task": tid, "ctx": ctx_usage(pane)}, ensure_ascii=False))
+    result = {"ok": True, "target": disp_of(rec), "pane": pane,
+              "task": tid, "ctx": ctx_usage(pane)}
+    if choice_override:
+        # --force 绕过护栏三时必须在返回里显式喊出来，不能只在拒绝时警告、
+        # 覆盖成功时却安安静静——那等于让人更容易忽略自己刚做了什么。
+        result["warning"] = ("已用 --force 覆盖一个正等待人工确认的交互选择框，"
+                              "确认这不是替他做了本该他自己点头的决定")
+    print(json.dumps(result, ensure_ascii=False))
     return 0
 
 
