@@ -127,6 +127,65 @@ def tmux_send(pane: str, text: str) -> bool:
     return code == 0
 
 
+def pending_input(pane: str) -> str:
+    """输入框里有没有已经打进去、但还没敲回车提交的文字。
+
+    背景：`/compact` 送进输入框是**下一轮开头才真正执行**的——中间只要再
+    wake 一次，新任务会占掉那一轮，压缩指令就被冲掉了，会话继续涨，谁都
+    不知道（2026-07-31 晚上真实发生两次：077601b8 送了 /compact 又被派活，
+    401k 才被自己发现；297b11d9 585k 时 /compact 发出但数字没降）。
+    靠派活的人记得先看一眼不可靠，所以在 wake 里机械挡一道。
+
+    Claude Code 的输入框是个方框，提示符是 "❯ "；正常时提示符后面啥都
+    没有。方框上边框是带标题的 "──── 项目名 ──"，下边框是纯 "─" 一行。
+    有文字排着没提交时,提示符和下边框之间会有内容——扫到下边框为止,
+    别只看提示符那一行,免得长文本换行漏看。
+    """
+    if not pane or not pane.startswith("%"):
+        return ""
+    code, out = sh(["tmux", "capture-pane", "-t", pane, "-p", "-S", "-20"])
+    if code != 0:
+        return ""
+    lines = out.splitlines()
+    prompt_i = None
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith("❯"):
+            prompt_i = i          # 取最后一次出现，避免历史输出里凑巧带这个符号
+    if prompt_i is None:
+        return ""
+    buf = []
+    first = lines[prompt_i].strip()[1:].strip()
+    if first:
+        buf.append(first)
+    for ln in lines[prompt_i + 1:]:
+        s = ln.strip()
+        if not s:
+            continue
+        if re.fullmatch(r"─+", s):        # 下边框：到此为止
+            break
+        buf.append(s)
+    return " ".join(buf).strip()
+
+
+def ctx_usage(pane: str):
+    """从页脚那行解析上下文占用，形如 "529k (53%)"。
+
+    页脚格式参考：`[Opus 5 (1M context)] 项目名  ▓▓▓░░ 53% (529k)  ⚠⚠ /compact now`。
+    解析不到就返回 None——**不猜、不报错**，页脚格式以后要是变了，这里
+    应该老实说"不知道"，不该给一个可能是错的数字出去。
+    """
+    if not pane or not pane.startswith("%"):
+        return None
+    code, out = sh(["tmux", "capture-pane", "-t", pane, "-p", "-S", "-15"])
+    if code != 0:
+        return None
+    m = re.search(r"(\d+)%\s*\((\d+k)\)", out)
+    if not m:
+        return None
+    pct, kk = m.group(1), m.group(2)
+    return f"{kk} ({pct}%)"
+
+
 def sh(args: list[str], timeout=5) -> tuple[int, str]:
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
@@ -945,6 +1004,17 @@ def cmd_wake(args):
                           "error": "它正在跑，现在打字会打断它；真要插队加 --force"},
                          ensure_ascii=False))
         return 1
+    pending = pending_input(pane)
+    if pending and not args.force:
+        # 护栏一：输入框里排着没提交的东西（尤其 /compact）就别再往里塞字了——
+        # 新文字会跟它拼在一起或把它冲掉，压缩指令就这么悄悄没执行过。
+        # 误判的代价是"这次没派进去"，比"静默冲掉压缩、会话继续涨"轻得多，
+        # 所以宁可严一点，--force 留给确实要插队的时候。
+        print(json.dumps({"ok": False, "target": disp_of(rec), "state": "pending-input",
+                          "error": f"输入框里有未执行的内容（{pending[:60]}），"
+                                   "现在打字会把它冲掉；确认要覆盖加 --force"},
+                         ensure_ascii=False))
+        return 1
     if args.dry_run:
         print(json.dumps({"ok": True, "dry_run": True, "target": disp_of(rec),
                           "pane": pane, "task": args.task}, ensure_ascii=False))
@@ -967,8 +1037,11 @@ def cmd_wake(args):
     append_event({"who": "fleet", "when": ts(now()), "kind": "wake",
                   "project": rec.get("project", ""),
                   "what": f"唤醒 {disp_of(rec)}：{args.task[:120]}", "where": pane})
+    # 护栏二：把这次派活时目标会话的上下文占用亮出来，派活的人一眼就能看见
+    # "这个会话快满了"，不用等它交活才发现——2026-07-31 晚上主会话派活前
+    # 从来不看对方上下文，直接给 529k 的会话又派了新活。
     print(json.dumps({"ok": True, "target": disp_of(rec), "pane": pane,
-                      "task": tid}, ensure_ascii=False))
+                      "task": tid, "ctx": ctx_usage(pane)}, ensure_ascii=False))
     return 0
 
 
