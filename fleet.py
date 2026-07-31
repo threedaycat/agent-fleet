@@ -437,6 +437,41 @@ def task_write(rec: dict):
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+# ---------------------------------------------------------------- 回执闭环
+#
+# 背景：派活的回执和普通噪音过滤共用同一条「要不要上报主会话」的判断通道，
+# 靠的是下级会话自觉在收尾文本里打 @5380 标记。2026-07-31 实测：601 条事件
+# 只有 94 条带标记，一次真实的「值班查到了实锤但忘了打标记」直接导致主会话
+# 收不到答案。可靠性不能建在「记得打标记」这个约定上，所以改成机械判断：
+# wake 派活时记下「等哪个 sid 的下一次收尾」，那次收尾时不管会话自己写了什么，
+# 无条件加 @5380 强制放行，回传一次就销账，后续收尾照旧走原来的过滤。
+
+# 强制转发的开关/阈值挂载点。机主原话「如果回传的太多，我们再想办法加一层过滤」——
+# 现在按他的要求先不做过滤，保持 None 就是「pending_receipt 命中就转发」。
+# 以后要限流/按类型挑着转，就在这里换成 Callable[[dict], bool]，返回 False 就不强制。
+RECEIPT_FILTER = None
+
+
+def pending_receipt(sid: str):
+    """这个 sid 名下有没有「5380 派活、等它这次收尾回执」还没销的账。
+
+    同一个会话可能同时压着不止一条 wake（少见但可能），取最早那条——
+    先派的先收，别让后面新派的把老的回执顺序打乱。
+    """
+    tasks = tasks_load()
+    hits = [t for t in tasks.values()
+            if t.get("target_sid") == sid and t.get("receipt") == "pending"]
+    if not hits:
+        return None
+    hits.sort(key=lambda t: t.get("ts", ""))
+    return hits[0]
+
+
+def mark_receipted(tid: str):
+    """回执已经强制转发出去了，销账——不然同一个会话下一次普通收尾又会被强制转发。"""
+    task_write({"id": tid, "receipt": "done", "ts": ts(now())})
+
+
 def cmd_task(args):
     if args.op == "add":
         rec = {"id": task_id(), "text": args.text,
@@ -790,9 +825,16 @@ def beat(sid: str, state="idle", project="", cwd="", note="", where="") -> dict:
     # （实测 a1ebe6e7 / 1031001a 就是这样：hook 跑了、note 空、events 一条没有）。
     # kind=turn-done：这一轮活干完了。board 的「谁交活了」看的就是它，
     # 主会话不用轮询谁在忙 —— 收尾时自己会报。
+    what = note or "(收尾无文本)"
+    receipt = pending_receipt(sid)
+    if receipt and (RECEIPT_FILTER is None or RECEIPT_FILTER(receipt)):
+        # 机械回执：不管这段收尾文本本身有没有 @5380，这次一律强制放行，
+        # 派活时等的就是「它这次收尾」，不能靠它自己想起来打标记。
+        what = "@5380 " + what
+        mark_receipted(receipt["id"])
     append_event({"who": sid[:8], "when": ts(now()), "kind": "turn-done",
                   "project": rec["project"],
-                  "what": note or "(收尾无文本)", "where": where})
+                  "what": what, "where": where})
     live = sessions().get(sid) or {}
     return {"ok": True, "sid": sid[:8], "project": rec["project"],
             "tmux": live.get("tmux", "?"), "state": live.get("state", "?")}
@@ -911,6 +953,8 @@ def cmd_wake(args):
     tid = task_id()
     task_write({"id": tid, "text": args.task,
                 "target": rec.get("project") or sid[:8],
+                "target_sid": sid, "dispatcher": env_sid()[:8] or "unknown",
+                "receipt": "pending",
                 "status": "dispatched", "reason": "fleet.py wake 直接派的",
                 "ts": ts(now())})
     append_event({"who": "fleet", "when": ts(now()), "kind": "wake",
