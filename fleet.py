@@ -1117,6 +1117,136 @@ def cmd_wake(args):
     return 0
 
 
+def last_task_text(sid: str) -> str:
+    """这个会话名下最近一次被 `wake` 派的任务原文。
+
+    `cmd_compact` 用它在压缩把输入框冲掉之后重发一遍——2026-08-01 凌晨
+    编队高强度跑了一夜，中枢直接往会话里发 /compact，四个会话都压成功
+    了，但压缩把同一轮派的任务原文一起清掉了，四个全变成"静默且名下有
+    活没交"，各自空转到下一次巡检才被发现。
+    """
+    tasks = tasks_load()
+    hits = [t for t in tasks.values() if t.get("target_sid") == sid and t.get("text")]
+    if not hits:
+        return ""
+    hits.sort(key=lambda t: t.get("ts", ""))
+    return hits[-1].get("text", "")
+
+
+def _ctx_kb(ctx):
+    """把 ctx_usage 返回的 "529k (53%)" 解析成 529 这个整数，方便前后比大小。
+    解析不到就 None——上游按"拿不到数字就没法判断有没有降"处理，不猜。"""
+    if not ctx:
+        return None
+    m = re.match(r"(\d+)k", ctx)
+    return int(m.group(1)) if m else None
+
+
+def cmd_compact(args):
+    """帮某个会话做一次 /compact，压完自动把它原来那条任务原文重发一遍。
+
+    背景：中枢直接 wake `/compact` 会跟"输入框有未提交内容"犯的是同一个
+    错——`/compact` 排进输入框是下一轮开头才真正执行的，如果这中间那条
+    任务原文被压缩冲掉，会话就干等在那，中枢也不知道，直到下一次巡检
+    才会被发现（2026-08-01 凌晨一次冲掉了四个会话的任务，7-31 晚 SQL
+    修复那次也丢过一个）。这个子命令把"发 /compact、等它真压完、把原
+    任务原文重发一遍"做成一步，不用中枢自己盯着、自己算时机。
+
+    走跟 `wake` 完全一样的三道护栏（busy / pending-input /
+    awaiting-choice）——这条路径本质也是往别人输入框发字，不能因为
+    "是在帮它做好事"就绕过去，裸发照样是往别人输入框里硬塞。
+
+    "压完了没"怎么判：不 sleep 固定秒数（固定秒数treat 不同大小的
+    上下文一个样，快了误判没压完、慢了白等）。改成轮询页脚：只要
+    上下文数字（ctx_usage 解析出的 k 值）比发 /compact 前**降下来了**，
+    或者会话回到 `sessions()` 的 idle 状态且数字确实变了，就判定压完；
+    轮询间隔 3 秒，设一个总超时（默认 90 秒，`--timeout` 可调），超时
+    就放弃等待、但仍然尝试重发原任务——总不能因为等不到信号就永远
+    不把任务还回去。
+    """
+    sid, rec = resolve_target(args.target)
+    if not sid and rec.get("ambiguous"):
+        print(json.dumps({"ok": False, "error": f"「{args.target}」匹配到多个会话，"
+                          "请改用 sid 前缀指定（不猜，免得打错 pane）",
+                          "candidates": rec["ambiguous"]}, ensure_ascii=False, indent=1))
+        return 1
+    if not sid:
+        print(json.dumps({"ok": False, "error": f"找不到会话：{args.target}",
+                          "hint": "fleet.py list 看有哪些"}, ensure_ascii=False))
+        return 1
+    pane = rec.get("pane", "")
+    if not pane_alive(pane):
+        print(json.dumps({"ok": False, "target": disp_of(rec), "pane": pane,
+                          "error": "pane 不在了，这个会话已经关掉"}, ensure_ascii=False))
+        return 1
+    if rec.get("state") == "busy" and not args.force:
+        print(json.dumps({"ok": False, "target": disp_of(rec), "state": "busy",
+                          "error": "它正在跑，现在压会打断它；真要插队加 --force"},
+                         ensure_ascii=False))
+        return 1
+    if awaiting_choice(pane) and not args.force:
+        print(json.dumps({"ok": False, "target": disp_of(rec), "state": "awaiting-choice",
+                          "error": "对面停在一个交互选择框上，硬发 /compact 会被当成"
+                                   "按键响应；确认要覆盖加 --force"}, ensure_ascii=False))
+        return 1
+    pending = pending_input(pane)
+    if pending and not args.force:
+        print(json.dumps({"ok": False, "target": disp_of(rec), "state": "pending-input",
+                          "error": f"输入框里已经有未执行的内容（{pending[:60]}），"
+                                   "现在发 /compact 会把它冲掉；确认要覆盖加 --force"},
+                         ensure_ascii=False))
+        return 1
+
+    task_text = last_task_text(sid)
+    ctx_before = ctx_usage(pane)
+    kb_before = _ctx_kb(ctx_before)
+
+    if not tmux_send(pane, "/compact"):
+        print(json.dumps({"ok": False, "error": "/compact 发送失败（pane 为空/不是 %NN/已关）",
+                          "pane": pane}, ensure_ascii=False))
+        return 1
+    append_event({"who": "fleet", "when": ts(now()), "kind": "compact",
+                  "project": rec.get("project", ""),
+                  "what": f"外部压缩 {disp_of(rec)}（压前 {ctx_before}）", "where": pane})
+
+    deadline = time.time() + args.timeout
+    settled = False
+    while time.time() < deadline:
+        time.sleep(3)
+        if not pane_alive(pane):
+            break
+        kb_cur = _ctx_kb(ctx_usage(pane))
+        live = sessions().get(sid) or {}
+        if kb_cur is not None and kb_before is not None and kb_cur < kb_before:
+            settled = True
+            break
+        if live.get("state") == "idle" and kb_cur is not None and kb_cur != kb_before:
+            settled = True
+            break
+
+    ctx_after = ctx_usage(pane)
+    result = {"ok": True, "target": disp_of(rec), "pane": pane,
+              "ctx_before": ctx_before, "ctx_after": ctx_after, "settled": settled}
+    if not settled:
+        result["warning"] = (f"等了 {args.timeout}s 没等到上下文数字降下来，"
+                              "可能没压完；仍会尝试把原任务重发一遍")
+    if task_text:
+        if pane_alive(pane) and tmux_send(pane, task_text):
+            result["resent"] = True
+            append_event({"who": "fleet", "when": ts(now()), "kind": "compact-resend",
+                          "project": rec.get("project", ""),
+                          "what": f"压完重发 {disp_of(rec)}：{task_text[:120]}",
+                          "where": pane})
+        else:
+            result["resent"] = False
+            result["error"] = "压完重发原任务失败"
+    else:
+        result["resent"] = False
+        result["note"] = "台账里没找到这个会话最近一次的派活原文，没有可重发的内容"
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def mark_wake(sid: str, task: str):
     """只在 sidecar 上记「上次被唤醒」。不写状态 —— 状态归 tmux 那份真相。"""
     side = load_json(FLEET, {})
@@ -1284,6 +1414,12 @@ def main() -> int:
     p.add_argument("--force", action="store_true", help="它在跑也插队")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_wake)
+
+    p = sub.add_parser("compact", help="外部帮会话 /compact，压完自动重发原任务")
+    p.add_argument("target", help="sid 前缀，或项目名")
+    p.add_argument("--force", action="store_true", help="绕过三道护栏（busy/pending-input/awaiting-choice）")
+    p.add_argument("--timeout", type=int, default=90, help="等压完的最长秒数（默认 90）")
+    p.set_defaults(fn=cmd_compact)
 
     p = sub.add_parser("board", help="生成网页版 board（终端版已退役）")
     p.add_argument("--loop", type=int, default=0, help="每 N 秒重生成一次（常驻）")
