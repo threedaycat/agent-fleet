@@ -1262,17 +1262,21 @@ def cmd_hook_stop(cfg, args):
     """
     raw = sys.stdin.read()
     payload = load_json_str(raw)
+    sid = sid_of(payload)
+    # 事件落盘排第一，早于任何可能崩溃或卡住的逻辑（remote_active 读状态、
+    # push_procs/push_start 拉子进程、下面的长轮询）。beat_fleet 内部整段包在
+    # try 里，绝不会因为报心跳本身失败而挡住收尾——但那挡不住的是*它前面*
+    # 的代码炸了。2026-07-28 实测过一次 push_start 附近 27ms 就 exit=1 的
+    # 崩溃，那一轮收尾当时在 fleet 里彻底没留痕。心跳/事件先报，慢的和可能崩
+    # 的部分放后面，就算后面那段真的炸了或被超时杀掉，这一轮也已经落过账了。
+    #
+    # （另一桩历史事故——某会话被注入后真干了 1 分半，events.ndjson 却整整
+    # 16 分钟没心跳——根因是下面 stop_hook_active 分支当时直接 return、没报
+    # 心跳，跟这里无关，早已修过。）
+    beat_fleet(sid, payload)
     if payload.get("stop_hook_active"):
         # 已经是被 hook 续过一轮了，先放它停，避免来回顶着不落地。
-        #
-        # 但**心跳必须先报**。这条早退路径专门发生在「上一轮 hook 返回过
-        # decision:block」之后 —— 也就是刚被投了活（遥控指令 / routed 钉钉消息）
-        # 那个会话，干完正事收尾的这一刻。以前直接 return，结果恰恰是最该被看见的
-        # 那次收尾在 fleet 里没留痕：实测某会话被注入后真干了 1 分半，
-        # events.ndjson 里却整整 16 分钟没有一条心跳。
-        # 收尾照旧放它停，只是别把这一轮从账上抹掉。
-        sid = sid_of(payload)
-        beat_fleet(sid, payload)
+        # 心跳已经在上面报过了，这里不用再报一次。
         logline(f"[hook-stop] sid={sid_tag(sid)} stop_hook_active=1 "
                 f"（上一轮注入过活）→ 报心跳后放它停")
         return 0
@@ -1282,8 +1286,6 @@ def cmd_hook_stop(cfg, args):
     # push-loop 不再是 launchd 常驻进程，没人帮它重起了，这是唯一的兜底。
     if alive and not push_procs():
         push_start()
-    sid = sid_of(payload)
-    beat_fleet(sid, payload)
     state = load_json(STATE, {})
     spoke = False
     if alive and cfg["cc"]["broadcast_on_stop"]:
