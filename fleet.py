@@ -189,11 +189,15 @@ def pending_input(pane: str) -> str:
         return ""
     buf = []
     first = lines[prompt_i].strip()[1:].strip()
-    if first:
+    if first and first != "Press up to edit queued messages":
+        # "Press up to edit queued messages" 不是没提交的文字，是提交成功、
+        # 对方正忙、消息已排队的提示——2026-08-01 5380 实测：wake 发给一个
+        # 正忙的会话（%25），消息确实排队成功了，但这行提示被当成"框里还有
+        # 字"，导致 wake 判定发送失败、报了假阴性。当成空，别当成待提交内容。
         buf.append(first)
     for ln in lines[prompt_i + 1:]:
         s = ln.strip()
-        if not s:
+        if not s or s == "Press up to edit queued messages":
             continue
         if re.fullmatch(r"─+", s):        # 下边框：到此为止
             break
