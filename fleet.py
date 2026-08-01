@@ -103,17 +103,40 @@ def env_sid() -> str:
             or os.environ.get("CLAUDE_SESSION_ID") or "").strip()
 
 
+MAX_ENTER_RETRIES = 3      # 回车补发的上限——宁可放弃也别死循环往人家输入框塞字
+ENTER_RETRY_WAIT = 0.6     # 每次补发后等多久再回读
+BASE_SEND_DELAY = 0.4      # 短文本的基础延时
+PER_CHAR_DELAY = 0.001     # 每个字符多等多久（长文本按长度线性加）
+MAX_SEND_DELAY = 3.0       # 延时上限，别为了超长文本无限等
+
+
 def tmux_send(pane: str, text: str) -> bool:
     """往指定 pane 发一段文字并回车。**唯一允许发 send-keys 的地方。**
 
-    三条防护，每条都是踩过的：
+    四条防护，每条都是踩过的：
       1. **pane 为空一律拒发**。`tmux send-keys` 不带 `-t` 会打到「当前活动 pane」——
          2026-07-30 自测时就因为取 pane-id 的命令写错、target 变成空字符串，
          把一条命令打进了别人正在看的 shell 里并执行了。宁可不发，不能乱发。
       2. **只接受 pane-id（`%NN`）**，不接受 `session:window` 名 —— 会话改名后
          按名字发会静默打空（`journal` 被改成 `OS` 那次就是）。
-      3. **文字和回车之间停 0.4 秒**。`-l` 把文字塞进输入框是异步的，
-         紧跟着发 Enter 会跟文字挤在一起，任务停在输入框里没提交，文本越长越容易中。
+      3. **文字和回车之间按文本长度动态停一下**。`-l` 把文字塞进输入框是异步的，
+         紧跟着发 Enter 会跟文字挤在一起，任务停在输入框里没提交，文本越长
+         越容易中——2026-08-01 实测：`capture-pane` 层面文字其实几乎立刻就
+         "看着"落定了（回读内容早就稳定），但 Claude Code 内部真正处理完
+         这段输入、进入"能接受 Enter＝提交"的状态明显更慢，固定 0.4s 对
+         长文本不够，得按长度动态加长（有上限，别无限等）。
+      4. **回车之后回读一次输入框，确认真的空了**。`send-keys` 返回 0 只说明
+         tmux 把按键送进了 pane，不保证 Claude Code 真的收下了回车——
+         2026-08-01 凌晨实测两次：077601b8 卡了 54 分钟、33a78f55 卡了
+         79 分钟，文本进了输入框但没提交，会话就那么干等着，是中枢手工
+         再敲一次回车才动。"发出去了"不等于"提交了"，跟"send-keys
+         返回 0 不等于打对了 pane"是同一类坑。回读用 `pending_input`——
+         没空就当没提交、补发一次 Enter，最多 `MAX_ENTER_RETRIES` 次，
+         别死循环往人家输入框里塞字。**这条是兜底，不是主力**——实测过
+         单靠回车重试救不回来（应用没就绪时，再敲几次 Enter 也没用，
+         只有等第 3 条的动态延时到位才真正提交得掉），真正起作用的是
+         第 3 条；第 4 条留着是为了"提交没提交"这件事不再靠猜、靠沉默
+         的 `send-keys` 返回值。
     """
     if not pane or not pane.startswith("%"):
         return False
@@ -122,9 +145,15 @@ def tmux_send(pane: str, text: str) -> bool:
     code, _ = sh(["tmux", "send-keys", "-t", pane, "-l", text])
     if code != 0:
         return False
-    time.sleep(0.4)
-    code, _ = sh(["tmux", "send-keys", "-t", pane, "Enter"])
-    return code == 0
+    time.sleep(min(MAX_SEND_DELAY, BASE_SEND_DELAY + len(text) * PER_CHAR_DELAY))
+    for _ in range(MAX_ENTER_RETRIES):
+        code, _ = sh(["tmux", "send-keys", "-t", pane, "Enter"])
+        if code != 0:
+            return False
+        time.sleep(ENTER_RETRY_WAIT)
+        if not pending_input(pane):
+            return True
+    return not pending_input(pane)
 
 
 def pending_input(pane: str) -> str:
