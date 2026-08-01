@@ -130,13 +130,16 @@ def tmux_send(pane: str, text: str) -> bool:
          2026-08-01 凌晨实测两次：077601b8 卡了 54 分钟、33a78f55 卡了
          79 分钟，文本进了输入框但没提交，会话就那么干等着，是中枢手工
          再敲一次回车才动。"发出去了"不等于"提交了"，跟"send-keys
-         返回 0 不等于打对了 pane"是同一类坑。回读用 `pending_input`——
-         没空就当没提交、补发一次 Enter，最多 `MAX_ENTER_RETRIES` 次，
-         别死循环往人家输入框里塞字。**这条是兜底，不是主力**——实测过
-         单靠回车重试救不回来（应用没就绪时，再敲几次 Enter 也没用，
-         只有等第 3 条的动态延时到位才真正提交得掉），真正起作用的是
-         第 3 条；第 4 条留着是为了"提交没提交"这件事不再靠猜、靠沉默
-         的 `send-keys` 返回值。
+         返回 0 不等于打对了 pane"是同一类坑。回读用 `pending_input_stable`
+         （单次 `pending_input` 会读到 `capture-pane` 的旧帧，5380 同一天
+         实测出的另一坑，见该函数文档）——没空就当没提交、补发一次
+         Enter，最多 `MAX_ENTER_RETRIES` 次，别死循环往人家输入框里塞字。
+         **这条是兜底，不是主力**——实测过单靠回车重试救不回来（应用没
+         就绪时，再敲几次 Enter 也没用，只有等第 3 条的动态延时到位才
+         真正提交得掉），真正起作用的是第 3 条；第 4 条留着是为了"提交
+         没提交"这件事不再靠猜、靠沉默的 `send-keys` 返回值——但它的
+         可靠性有上限：`pending_input_stable` 连续两次撞上同一帧旧值时
+         仍会给出错误答案，这里没有更强的判据可用。
     """
     if not pane or not pane.startswith("%"):
         return False
@@ -151,9 +154,11 @@ def tmux_send(pane: str, text: str) -> bool:
         if code != 0:
             return False
         time.sleep(ENTER_RETRY_WAIT)
-        if not pending_input(pane):
+        stable = pending_input_stable(pane)
+        if stable == "":
             return True
-    return not pending_input(pane)
+        # stable is None（读不准）或非空字符串（确实还没提交）都继续重试
+    return pending_input_stable(pane) == ""
 
 
 def pending_input(pane: str) -> str:
@@ -194,6 +199,29 @@ def pending_input(pane: str) -> str:
             break
         buf.append(s)
     return " ".join(buf).strip()
+
+
+def pending_input_stable(pane: str, gap: float = 0.4):
+    """`pending_input` 单次抓屏靠不住,连抓两次、一致才采信。
+
+    2026-08-01 5380 实测踩出的新坑:`capture-pane` 会返回**旧帧**——
+    `send-keys -l` 发完立刻抓,抓到的还是发之前那帧;隔一次工具调用再抓
+    才显出新内容。反过来,清空之后抓到"已空",下一次又变回清空前的旧帧。
+    这条对 `tmux_send` 的第 4 条回读护栏是致命的:单次抓屏可能读到"发送前
+    的旧帧还有字"→ 误判没提交 → 多补一次回车 → 可能把下一条消息错误提交;
+    也可能读到"清空前的旧帧是空的"→ 误判已提交 → 退出重试循环,又回到
+    要修的那个 bug,而且这次带着"已回读确认"的假象,比原来更难发现。
+
+    做法:间隔 `gap` 抓两次,一致才当真;不一致就返回 None,表示"读不准",
+    调用方必须自己决定不确定时怎么办,不能当成确定的空或确定的非空。
+    这不是万能药——两次都撞上同一帧旧值的概率不为零,只是把误判概率
+    从"每次都可能撞上"降到"连续两次都撞上同一个错帧",值得记录这个
+    可靠性上限,不能写成"已解决"。
+    """
+    a = pending_input(pane)
+    time.sleep(gap)
+    b = pending_input(pane)
+    return a if a == b else None
 
 
 def capture_tail(pane: str, n: int = 6) -> str:
@@ -1106,14 +1134,19 @@ def cmd_wake(args):
                              ensure_ascii=False))
             return 1
         choice_override = True
-    pending = pending_input(pane)
-    if pending and not args.force:
+    # 护栏一用 pending_input_stable：单次 pending_input 会读到 capture-pane
+    # 的旧帧（2026-08-01 5380 在 297b11d9 上实测出来的坑），None（连抓两次
+    # 不一致，读不准）时按"有"处理——宁可误拒，不能拿不确定的读数当成"空"
+    # 而硬发字冲掉别人真正没提交完的内容。
+    pending = pending_input_stable(pane)
+    if pending != "" and not args.force:
         # 护栏一：输入框里排着没提交的东西（尤其 /compact）就别再往里塞字了——
         # 新文字会跟它拼在一起或把它冲掉，压缩指令就这么悄悄没执行过。
         # 误判的代价是"这次没派进去"，比"静默冲掉压缩、会话继续涨"轻得多，
         # 所以宁可严一点，--force 留给确实要插队的时候。
+        shown = "读不准（两次抓屏不一致）" if pending is None else pending[:60]
         print(json.dumps({"ok": False, "target": disp_of(rec), "state": "pending-input",
-                          "error": f"输入框里有未执行的内容（{pending[:60]}），"
+                          "error": f"输入框里可能有未执行的内容（{shown}），"
                                    "现在打字会把它冲掉；确认要覆盖加 --force"},
                          ensure_ascii=False))
         return 1
@@ -1225,10 +1258,13 @@ def cmd_compact(args):
                           "error": "对面停在一个交互选择框上，硬发 /compact 会被当成"
                                    "按键响应；确认要覆盖加 --force"}, ensure_ascii=False))
         return 1
-    pending = pending_input(pane)
-    if pending and not args.force:
+    # 同 cmd_wake：用 pending_input_stable，读不准（None）按"有"处理，
+    # 不能拿不确定的读数当"空"去发 /compact。
+    pending = pending_input_stable(pane)
+    if pending != "" and not args.force:
+        shown = "读不准（两次抓屏不一致）" if pending is None else pending[:60]
         print(json.dumps({"ok": False, "target": disp_of(rec), "state": "pending-input",
-                          "error": f"输入框里已经有未执行的内容（{pending[:60]}），"
+                          "error": f"输入框里可能已经有未执行的内容（{shown}），"
                                    "现在发 /compact 会把它冲掉；确认要覆盖加 --force"},
                          ensure_ascii=False))
         return 1
