@@ -984,7 +984,14 @@ def cmd_list(args):
     print(f"{'sid':10} {'项目':16} {'tmux':16} {'状态':12} 最后一句")
     for r in rows:
         mark = {"idle": "○ 闲着", "busy": "● 在跑"}.get(r["state"], r["state"])
-        if r["age"] > args.stale_after:
+        # "静默"该按"有没有在干活"算，不是按"最后一次输出行"的时间算——
+        # 2026-08-01 5380 实测：297b11d9 跑一个 1h23m 的隔离库测试，全程不
+        # 产生新输出行，`age`（离 status.json 上次 updated_at 的秒数）
+        # 一路涨过 stale_after，被下面这行盖成了"静默 63m"，看着像停工，
+        # 差点被叫醒打断——它其实在 tmux-claude-status.json 里明明白白
+        # 标着 running（busy）。busy 是判"在不在干活"的权威信号，不该被
+        # "多久没吐一行字"这种弱信号覆盖，所以 busy 时这行直接跳过。
+        if r["state"] != "busy" and r["age"] > args.stale_after:
             mark = f"· 静默{fmt_age(r['age'])}"
         print(f"{r['sid'][:8]:10} {pad(r['project'], 16)} {pad(r['tmux'], 16)} "
               f"{pad(mark, 12)} {r['note'][:38]}")
