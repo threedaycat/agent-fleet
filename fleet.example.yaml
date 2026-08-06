@@ -1,0 +1,74 @@
+# workOS 本体拓扑 · 模板
+#
+# 复制成 _local-fleet.yaml 再改（_local-* 被 .gitignore 挡掉，不会带着你的真实路径进版本库）：
+#     cp fleet.example.yaml _local-fleet.yaml
+#     ./fleet_up.py up
+#
+# ── 这份文件只描述「不管手上是什么项目都要有」的基础设施 ──
+#
+# 具体项目的会话（某个 app、某条业务线、某次重构）**不要写进来**。那些是干活时临时开的，
+# 随项目生灭；写进来只会让这份配置变成「你今天的工作现场快照」，换台机器复现出一堆
+# 跟新机器无关的空目录。要给某个项目存档拓扑，用 `./fleet_up.py capture -s <名字> -o <别的文件>`。
+#
+# ── 字段 ──
+#   sessions[].name            tmux session 名
+#   sessions[].windows[].name  window 名（不要带状态图标，那是 hook 实时改的）
+#   .layout                    tmux 布局：even-horizontal / even-vertical / main-vertical / tiled
+#   .panes[].cwd               pane 的工作目录，~ 会展开
+#   .panes[].role              起一个 Claude 并喂 _local-roles/<role>.md（回落 roles/<role>.md）
+#   .panes[].claude: true      起一个不带角色的空白 Claude
+#   .panes[].cmd               起一个普通命令（不写就是默认 shell）
+
+version: 1
+
+defaults:
+  claude_cmd: claude
+
+sessions:
+  - name: workos
+    windows:
+      # 总控。你只跟它说话，由它去调度其它会话（见 SYSTEM.md §4）。
+      - name: main
+        layout: main-vertical
+        panes:
+          - cwd: ~/workos
+            role: main
+          # 决策台：主会话把需要你拍板的事推过来，它弹选择框停住等你。
+          # 单独占一个 pane 是有原因的——它长期停在「等人选」的状态，
+          # 跟主会话共用会把主会话的输出冲掉。
+          - cwd: ~/workos
+            role: desk
+          - cwd: ~/workos
+
+      # 采集器运维：看日志、查队列、动 launchd 的那个窗口。
+      - name: watch
+        layout: main-vertical
+        panes:
+          - cwd: ~/dingtalk-watch
+            role: watch
+          - cwd: ~/dingtalk-watch
+            cmd: ./run.sh tail
+
+      # 巡检：按 TRIAGE.md 定期过一遍待处理队列。
+      - name: duty
+        layout: even-horizontal
+        panes:
+          - cwd: ~/dingtalk-watch
+            role: duty
+          - cwd: ~/dingtalk-watch
+
+      # 健康检查：只读地盯着这套系统本身有没有跑歪。
+      - name: doctor
+        layout: even-horizontal
+        panes:
+          - cwd: ~/workos
+            role: doctor
+          - cwd: ~/workos
+
+      # 手机遥控通道。push-loop 只在出门开了 remote 时才跑，桌前空着是正常的。
+      - name: remote
+        layout: even-horizontal
+        panes:
+          - cwd: ~/dingtalk-watch
+            role: remote
+          - cwd: ~/dingtalk-watch

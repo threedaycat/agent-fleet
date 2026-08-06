@@ -134,31 +134,68 @@ python3 dtcc.py say "..."                     # 主动往手机播报一条（�
 ## 7. 在新机器上跑起来
 
 ```bash
-# 1. 代码
-git clone <本仓库>
-git clone <claude-tmux-sessions>           # TODO：补仓库地址。通用会话层，装它的 hook + picker
-
-# 2. dws（钉钉官方公开的命令行）
-npm i -g dingtalk-workspace-cli
-dws auth login                             # 扫码授权，管理员需在 open-dev 开「CLI 访问管理」
-
-# 3. 本机配置（不进版本库）
-cp config.example.json config.json         # 填自己的 open_dingtalk_id / user_id / 关注群 / 路由表
-
-# 4. hook：让每个 Claude 会话收尾时报心跳 + 探队列
-#    把 settings.example.json 的 hooks 段合并进 ~/.claude/settings.json
-#    （claude-tmux-sessions 的 install.sh 管会话状态那半）
-
-# 5. 常驻
-./run.sh install 300                       # 采集器上 launchd
-# push-loop 不开机自启，remote on 时才起
-
-# 6. 整夜干活（可选）：caffeinate 别让机器睡（插电才生效，合盖仍会睡）
+git clone <本仓库> && cd dingtalk-watch
+./fleet_up.py setup
 ```
+
+`setup` 是一条**交互式流水线**：八步，每步先自检，已完成的自动打勾跳过，
+没完成的停下来问你一句。任何时候 Ctrl-C 都能退，下次跑接着来。
+
+有几步注定**不能一键**，流水线不假装能——它停下来把该办的事讲清楚，等你办完按回车：
+
+| 步骤 | 为什么不能自动 |
+|---|---|
+| `dws auth login` | 钉钉授权是扫码换 token，且管理员要先在 open-dev 开「CLI 访问管理」 |
+| `config.json` | 里面是你自己的 open_dingtalk_id / 关注群 / 路由表，换个人全不一样 |
+| hooks 合并 | 要**并进** `~/.claude/settings.json`，不是覆盖——那文件里还有你自己的配置 |
+
+其余五步（依赖检查、launchd 装常驻、生成 `_local-fleet.yaml`、角色文件核对、
+把会话拉起来）流水线自己干。
+
+### 拓扑与角色（`fleet_up.py`）
+
+机器层装好了，还差**智能层**：开哪些 window、每个 pane 里坐着谁。这两样以前一个字
+都没落盘——角色只活在会话历史里，换台机器得到的是一堆失忆的 Claude。现在它们是文件：
+
+| 文件 | 是什么 | 进版本库 |
+|---|---|---|
+| `fleet.example.yaml` | workOS 本体的拓扑模板，无真实名字 | ✅ |
+| `_local-fleet.yaml` | 本机真实拓扑 | ❌ `_local-*` |
+| `roles/<name>.md` | 角色定义，通用版 | ✅ |
+| `_local-roles/<name>.md` | 角色定义，本机版，**优先于** `roles/` | ❌ `_local-*` |
+
+同 `TRIAGE.md` / `_local-TRIAGE.md` 的规矩，没有新概念。
+
+```bash
+./fleet_up.py up            # 照配置建 tmux（已存在的 session 跳过，不覆盖）
+./fleet_up.py up --dry-run  # 只打印要跑的 tmux 命令
+./fleet_up.py check         # 配置 vs 现实，对账
+./fleet_up.py doctor        # 只读自检
+./fleet_up.py capture -s OS # 给已有 session 逆向存档
+```
+
+**范围红线：这份配置只描述 workOS 本体**——主会话、desk、值班、采集器运维、遥控，
+这些不管你手上是什么项目都要有的基础设施。具体项目的会话随项目生灭，不属于这里。
+所以 `capture` 强制要求点名 session，不给「一把梭全抓」的默认行为：全抓出来的是
+你今天的工作现场，不是这套系统本身。
+
+角色是靠 `claude "$(cat roles/xxx.md)"` 喂进去的——把提示词当**首条消息**交给 claude
+自己，而不是先起 claude 再 `send-keys`，后者要靠猜「启动好了没」。
+
+> 踩过的坑：detached 建 session 不给 `-x/-y`，tmux 按 80x24 算，`main-vertical` 的
+> 主 pane 默认就要 80 列，**其余 pane 被压成 1 列宽**（实测 78x24 / 1x12 / 1x11）。
+> 命令照常送达执行，只是显示成一列一个字，看上去像「没送进去」；attach 上来也不会
+> 自动重排。`build_window()` 现在按当前 client 尺寸建，没 client 就用 204x60。
+> 另外定位 pane 一律用 pane-id（`%NN`），不用 `session:window.index`——window 名会被
+> hook 加状态图标、随时会指错地方（§4 也是这么定的）。
 
 细节：采集器 [README.md](README.md)、遥控 [DTCC.md](DTCC.md)、
 hook 结构 [settings.example.json](settings.example.json)、
 picker 键位在 claude-tmux-sessions 的 install.sh（默认 `prefix+g`）。
+
+> TODO：`com.workos.report.daily` / `report.weekly` / `caffeinate` 三个 launchd plist
+> 现在机器上跑着，但仓库里没有任何脚本会装它们，换机器不会自动有。
+> `fleet_up.py doctor` 会把它们标成 `(?)` 提醒，但还没有接管它们的安装。
 
 ---
 
