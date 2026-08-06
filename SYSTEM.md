@@ -193,9 +193,47 @@ git clone <本仓库> && cd dingtalk-watch
 hook 结构 [settings.example.json](settings.example.json)、
 picker 键位在 claude-tmux-sessions 的 install.sh（默认 `prefix+g`）。
 
-> TODO：`com.workos.report.daily` / `report.weekly` / `caffeinate` 三个 launchd plist
-> 现在机器上跑着，但仓库里没有任何脚本会装它们，换机器不会自动有。
-> `fleet_up.py doctor` 会把它们标成 `(?)` 提醒，但还没有接管它们的安装。
+### 定时与常驻（`fleet_up.py services`）
+
+以前这些是一条条手工 `launchctl` 装进去的，仓库零记录——换机器不会自动有，
+改过什么也无从查起。现在同样是声明：`services.example.yaml` / `_local-services.yaml`。
+
+```bash
+./fleet_up.py services status      # 装没装 + plist 内容跟声明对不对得上
+./fleet_up.py services install     # 全装
+./fleet_up.py services install console
+./fleet_up.py services uninstall <名字>
+```
+
+`status` 不只看「装没装」，还比对 plist 内容与声明是否一致——**装了但内容对不上，
+比压根没装更难查**。
+
+两个字段值得记住：
+
+- `owner:` —— 这条由别的东西安装（比如采集器三件套是 `./run.sh install` 装的），
+  本层只登记、不接管。**重复安装会变成两份进程轮同一份 token、写同一份
+  `state.json`**，表现是「采集变慢、疑似停了」，根因却是装了两遍。
+- `env:` 不写会自动补 `PATH`/`HOME`。launchd 给的 PATH 是最小集，
+  不补的话 homebrew 装的东西一律 `command not found`，而且是**静默失败**。
+
+> 踩过的坑：plist 里写相对路径无声失效。launchd 的工作目录是 `/`，
+> `./data/x.out` 被解析成 `/data/x.out`，写不进去、进程照常起、日志一个字没有，
+> 看上去像「定时任务根本没跑」。现在 `cwd`/`log`/`cmd[0]` 一律转绝对路径
+> （相对路径按仓库目录解析）。
+
+### 控制台（`console.py`）
+
+```bash
+python3 console.py --open          # 生成并打开
+python3 console.py --loop 10       # 常驻重生成（已登记为 console 服务，默认就在跑）
+```
+
+`data/console/index.html`，静态文件，浏览器开个标签页常驻即可。六个区块：
+会话与角色、服务、拓扑对账、自检、采集器、事件流。**它把「声明」和「现实」
+摆在一起，不一致的地方直接标出来**——以前定位一个问题要人肉跑四五条命令再自己对账。
+
+跟 board 的分工别混：`board_html.py` 面向**消息**（我该处理什么事、谁在等我），
+`console.py` 面向**系统**（这套东西自己跑得对不对）。
 
 ---
 
