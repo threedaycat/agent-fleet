@@ -244,7 +244,7 @@ def target_size() -> tuple[int, int]:
                 return int(w), int(h)
         except ValueError:
             continue
-    return 204, 60
+    return 280, 80
 
 
 def pane_ids(target: str) -> list[str]:
@@ -428,6 +428,230 @@ def cmd_doctor(args) -> int:
 
     print("\n" + ("自检通过。" if ok else "有缺项，见上面未打勾的。"))
     return 0 if ok else 1
+
+
+# ---------------------------------------------------------------- services（定时/常驻）
+
+LOCAL_SVC = os.path.join(BASE, "_local-services.yaml")
+EXAMPLE_SVC = os.path.join(BASE, "services.example.yaml")
+LA_DIR = os.path.expanduser("~/Library/LaunchAgents")
+
+
+def load_svc(path: str | None = None) -> list[dict]:
+    p = path or (LOCAL_SVC if os.path.isfile(LOCAL_SVC) else EXAMPLE_SVC)
+    if not os.path.isfile(p):
+        return []
+    with open(p, encoding="utf-8") as f:
+        return ((yaml.safe_load(f) or {}).get("services")) or []
+
+
+def launchd_loaded(label: str) -> bool:
+    """直接查这个 label。
+
+    别用 `launchctl list | grep -q`：grep 命中就退出会给 launchctl 一个 SIGPIPE，
+    配上 pipefail 会假报「未加载」——run.sh 里为这个坑写过一大段注释。
+    """
+    return subprocess.run(["launchctl", "list", label],
+                          capture_output=True).returncode == 0
+
+
+def expand_weekdays(spec) -> list[int]:
+    """`1-5` / `[1,3,5]` / `5` 都收。1=周一，0/7=周日（launchd 的约定）。"""
+    if isinstance(spec, int):
+        return [spec]
+    if isinstance(spec, list):
+        return [int(x) for x in spec]
+    s = str(spec)
+    if "-" in s:
+        a, b = s.split("-", 1)
+        return list(range(int(a), int(b) + 1))
+    return [int(x) for x in s.split(",") if x.strip()]
+
+
+def abspath(p: str) -> str:
+    """展开 ~/$VAR，并把相对路径按**仓库目录**解析成绝对路径。
+
+    plist 里放相对路径是无声的坑：launchd 的工作目录是 `/`，`./data/x.out` 会被
+    解析成 `/data/x.out`，写不进去、进程照常起、日志一个字没有，你以为任务没跑。
+    （2026-08-06 实测：装了个 `/bin/echo` 的测试服务，日志文件始终是空的。）
+    所以这一层写出去的路径一律是绝对的。
+    """
+    e = expand(str(p))
+    return e if os.path.isabs(e) else os.path.normpath(os.path.join(BASE, e))
+
+
+def svc_plist(s: dict) -> dict:
+    """把一条 service 声明翻成 launchd plist 的 dict。"""
+    label = s["label"]
+    # cmd[0] 是程序路径，同样不能是相对的；后面的参数原样保留（可能就是字面量）
+    cmd = [str(x) for x in s["cmd"]]
+    cmd = [abspath(cmd[0])] + [expand(str(x)) for x in cmd[1:]]
+    d: dict = {"Label": label, "ProgramArguments": cmd}
+
+    if s.get("cwd"):
+        d["WorkingDirectory"] = abspath(s["cwd"])
+    if s.get("log"):
+        d["StandardOutPath"] = abspath(s["log"])
+        d["StandardErrorPath"] = abspath(s.get("log_err") or s["log"])
+    if s.get("keepalive"):
+        d["KeepAlive"] = True
+    d["RunAtLoad"] = bool(s.get("run_at_load", s.get("keepalive", False)))
+    if s.get("interval"):
+        d["StartInterval"] = int(s["interval"])
+
+    cal = s.get("calendar")
+    if cal:
+        out = []
+        for c in cal if isinstance(cal, list) else [cal]:
+            base = {}
+            if "hour" in c:
+                base["Hour"] = int(c["hour"])
+            if "minute" in c:
+                base["Minute"] = int(c["minute"])
+            if "day" in c:
+                base["Day"] = int(c["day"])
+            if "weekday" in c:
+                for wd in expand_weekdays(c["weekday"]):
+                    out.append(dict(base, Weekday=wd))
+            else:
+                out.append(base)
+        d["StartCalendarInterval"] = out
+
+    # launchd 给的 PATH 是最小集（/usr/bin:/bin:/usr/sbin:/sbin），homebrew 装的东西
+    # 一律找不到。不显式补 PATH 的服务，跑起来会以「command not found」静默失败。
+    env = dict(s.get("env") or {})
+    env.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:"
+                           f"{os.path.expanduser('~/.local/bin')}:/usr/bin:/bin:/usr/sbin:/sbin")
+    env.setdefault("HOME", os.path.expanduser("~"))
+    d["EnvironmentVariables"] = {k: expand(str(v)) for k, v in env.items()}
+    return d
+
+
+def svc_status(s: dict) -> tuple[str, str]:
+    """返回 (状态标记, 说明)。"""
+    label = s.get("label")
+    if s.get("owner"):
+        loaded = launchd_loaded(label) if label else False
+        return ("托管" if loaded else "未装"), f"由 {s['owner']} 安装，本层不接管"
+    if not label:
+        return "配置错", "缺 label"
+    if not launchd_loaded(label):
+        return "未装", ""
+    # 装了，再看 plist 内容跟声明对不对得上——漂移比没装更难查
+    p = os.path.join(LA_DIR, f"{label}.plist")
+    if not os.path.isfile(p):
+        return "不一致", "launchd 里加载着，但 ~/Library/LaunchAgents 下没有对应 plist"
+    try:
+        import plistlib
+        with open(p, "rb") as f:
+            live = plistlib.load(f)
+        want = svc_plist(s)
+        for k in ("ProgramArguments", "StartCalendarInterval", "StartInterval",
+                  "KeepAlive", "WorkingDirectory", "StandardOutPath"):
+            if live.get(k) != want.get(k):
+                return "漂移", f"{k} 与声明不一致"
+    except Exception as e:
+        return "读不了", str(e)
+    return "OK", ""
+
+
+def svc_install(s: dict, dry: bool = False) -> bool:
+    import plistlib
+    label = s["label"]
+    path = os.path.join(LA_DIR, f"{label}.plist")
+    d = svc_plist(s)
+    if dry:
+        print(f"    会写 {path}")
+        print(f"      {d['ProgramArguments']}")
+        return True
+    os.makedirs(LA_DIR, exist_ok=True)
+    for key in ("StandardOutPath", "StandardErrorPath"):
+        if d.get(key):
+            os.makedirs(os.path.dirname(d[key]), exist_ok=True)
+    with open(path, "wb") as f:
+        plistlib.dump(d, f)
+    uid = os.getuid()
+    # 先 bootout 再 bootstrap：重复 bootstrap 同一个 label 会报 5:Input/output error，
+    # 而且旧的定义还留在内存里，改了 plist 也不生效。
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{label}"], capture_output=True)
+    p = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", path],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        print(f"    bootstrap 失败：{p.stderr.strip() or p.stdout.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def svc_uninstall(s: dict) -> bool:
+    label = s["label"]
+    uid = os.getuid()
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{label}"], capture_output=True)
+    path = os.path.join(LA_DIR, f"{label}.plist")
+    if os.path.isfile(path):
+        os.remove(path)
+    return not launchd_loaded(label)
+
+
+def cmd_services(args) -> int:
+    svcs = load_svc(args.config)
+    if not svcs:
+        print(f"没有 services 配置。模板在 {EXAMPLE_SVC}，"
+              f"复制成 _local-services.yaml 再改。")
+        return 1
+
+    pick = set(args.name or [])
+    sel = [s for s in svcs if not pick or s.get("name") in pick]
+    if pick and not sel:
+        sys.exit(f"没有叫这些名字的服务：{' '.join(sorted(pick))}\n"
+                 f"有的是：{' '.join(s.get('name', '?') for s in svcs)}")
+
+    if args.action in ("list", "status"):
+        w = max(len(s.get("name", "?")) for s in sel)
+        for s in sel:
+            st, note = svc_status(s)
+            when = (f"每 {s['interval']}s" if s.get("interval")
+                    else "常驻" if s.get("keepalive")
+                    else fmt_calendar(s.get("calendar")) if s.get("calendar")
+                    else "手动")
+            print(f"  {st:<5} {s.get('name', '?'):<{w}}  {when:<18} {note}")
+        return 0
+
+    if args.action == "install":
+        n = 0
+        for s in sel:
+            name = s.get("name", "?")
+            if s.get("owner"):
+                print(f"  跳过 {name}：{s['owner']} 装的，本层不碰"
+                      f"（重复装会变成两份进程同时跑）")
+                continue
+            print(f"  装 {name} …")
+            if svc_install(s, dry=args.dry_run):
+                n += 1
+        print(f"\n{'[dry-run] ' if args.dry_run else ''}处理 {n} 个。")
+        return 0
+
+    if args.action == "uninstall":
+        for s in sel:
+            if s.get("owner"):
+                print(f"  跳过 {s.get('name')}：{s['owner']} 装的，用它自己的命令卸")
+                continue
+            if not pick and not args.yes:
+                sys.exit("卸载全部要加 --yes，或者点名 `services uninstall <名字>`")
+            print(f"  卸 {s.get('name')} … {'OK' if svc_uninstall(s) else '失败'}")
+        return 0
+    return 0
+
+
+def fmt_calendar(cal) -> str:
+    if not cal:
+        return ""
+    items = cal if isinstance(cal, list) else [cal]
+    out = []
+    for c in items:
+        wd = c.get("weekday")
+        t = f"{int(c.get('hour', 0)):02d}:{int(c.get('minute', 0)):02d}"
+        out.append(f"周{wd} {t}" if wd is not None else t)
+    return "、".join(out)
 
 
 # ---------------------------------------------------------------- setup 流水线
@@ -730,6 +954,14 @@ def main() -> int:
 
     d = sub.add_parser("doctor", help="开机自检")
     d.set_defaults(func=cmd_doctor)
+
+    v = sub.add_parser("services", help="定时/常驻任务（launchd）")
+    v.add_argument("action", choices=["list", "status", "install", "uninstall"])
+    v.add_argument("name", nargs="*", help="只处理这些服务，不给就是全部")
+    v.add_argument("--config", "-c", help="指定配置文件")
+    v.add_argument("--dry-run", "-n", action="store_true", help="只说要做什么，不动手")
+    v.add_argument("--yes", action="store_true", help="卸载全部时需要")
+    v.set_defaults(func=cmd_services)
 
     args = ap.parse_args()
     return args.func(args)
