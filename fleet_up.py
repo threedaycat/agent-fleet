@@ -688,6 +688,172 @@ def fmt_calendar(cal) -> str:
     return "、".join(out)
 
 
+# ---------------------------------------------------------------- memory（个人工作记忆）
+
+LOCAL_MEM = os.path.join(BASE, "_local-memory.yaml")
+EXAMPLE_MEM = os.path.join(BASE, "memory.example.yaml")
+
+
+def load_mem(path: str | None = None) -> list[dict]:
+    p = path or (LOCAL_MEM if os.path.isfile(LOCAL_MEM) else EXAMPLE_MEM)
+    if not os.path.isfile(p):
+        return []
+    with open(p, encoding="utf-8") as f:
+        return ((yaml.safe_load(f) or {}).get("memory")) or []
+
+
+def git(*args: str, cwd: str) -> tuple[int, str]:
+    p = subprocess.run(("git",) + args, cwd=cwd, capture_output=True, text=True)
+    return p.returncode, (p.stdout + p.stderr).strip()
+
+
+def find_memory(m: dict) -> str | None:
+    """按「首选位置 → 可能在的地方」的顺序找。
+
+    这一层存在的理由：换台机器、或者哪天目录挪了位置，工具应该**先去找**，
+    而不是当作不存在、然后在一个新位置开始干活——那会制造第二份真相，
+    两边都有内容、都不完整，之后再也说不清哪份是对的。
+    """
+    for p in [m.get("path")] + list(m.get("also") or []):
+        if not p:
+            continue
+        e = expand(p)
+        if os.path.isdir(e):
+            return e
+    return None
+
+
+def mem_info(m: dict) -> dict:
+    """一处记忆的现状。"""
+    found = find_memory(m)
+    d: dict = {"name": m.get("name", "?"), "what": m.get("what", ""),
+               "path": found, "declared": expand(m.get("path") or ""),
+               "remote_want": m.get("remote")}
+    if not found:
+        d["state"] = "没找到"
+        d["note"] = ("远端有，可以 import" if m.get("remote")
+                     else "声明里也没给远端，没法自动恢复")
+        return d
+
+    d["elsewhere"] = (found != d["declared"])
+
+    # 必须比对 **仓库根**，不能只问「这里是不是 git」。
+    # `git rev-parse --git-dir` 会一路往上走：在 ~/workos/workspace 里问，
+    # 它会找到父仓库 ~/workos 的 .git 然后回答「是」，于是 status 报出来的
+    # commit 数和脏文件数全是父仓库的——一个看起来有备份、其实完全没有的假象。
+    # （2026-08-06 实测：workspace 被报成「有未提交 3 个文件」，那 3 个是 workos 的。）
+    rc, top = git("rev-parse", "--show-toplevel", cwd=found)
+    if rc != 0:
+        d["state"] = "未纳入版本控制"
+        d["note"] = "改了什么、什么时候改的都没有记录，删了就没了"
+        return d
+    if os.path.realpath(top) != os.path.realpath(found):
+        d["state"] = "未纳入版本控制"
+        d["inside"] = shrink(top)
+        # 要问的是「里面的东西被忽略了吗」，不是「这个目录被忽略了吗」——
+        # 常见写法是 `workspace/*`（挡内容、放过目录本身），拿目录去问会答「没挡」，
+        # 于是漏报成普通子目录，而它其实一个文件都没进版本库。
+        child = next((os.path.join(found, x) for x in sorted(os.listdir(found))
+                      if not x.startswith(".")), None)
+        ignored = bool(child) and git("check-ignore", "-q", child, cwd=top)[0] == 0
+        d["ignored_by_parent"] = ignored
+        d["note"] = (f"它在 {shrink(top)} 仓库里，但"
+                     + ("内容被那个仓库的 .gitignore 挡着——一个文件都没进版本库，完全没有备份"
+                        if ignored else "本身不是独立仓库"))
+        return d
+
+    _, remote = git("remote", "get-url", "origin", cwd=found)
+    d["remote"] = remote if remote and "error" not in remote.lower() else None
+    _, dirty = git("status", "--porcelain", cwd=found)
+    d["dirty"] = len([x for x in dirty.splitlines() if x.strip()])
+    _, cnt = git("rev-list", "--count", "HEAD", cwd=found)
+    d["commits"] = cnt if cnt.isdigit() else "0"
+
+    if not d["remote"]:
+        d["state"] = "只在本机"
+        d["note"] = f"{d['commits']} 个 commit，但没有远端——这台机器没了就全没了"
+    elif d["dirty"]:
+        d["state"] = "有未提交"
+        d["note"] = f"{d['dirty']} 个文件改了没提交"
+    else:
+        d["state"] = "OK"
+        d["note"] = f"{d['commits']} 个 commit"
+    return d
+
+
+def cmd_memory(args) -> int:
+    mems = load_mem(args.config)
+    if not mems:
+        print(f"没有 memory 配置。模板在 {EXAMPLE_MEM}，复制成 _local-memory.yaml 再改。")
+        return 1
+
+    pick = set(args.name or [])
+    sel = [m for m in mems if not pick or m.get("name") in pick]
+    if pick and not sel:
+        sys.exit(f"没有这些：{' '.join(sorted(pick))}\n"
+                 f"有的是：{' '.join(m.get('name', '?') for m in mems)}")
+
+    if args.action == "status":
+        # 中文宽度对不齐，与其凑 padding 不如换成分行，反正只有几条
+        for m in sel:
+            i = mem_info(m)
+            print(f"[{i['state']}] {i['name']}　{i.get('what', '')}")
+            if i["path"]:
+                extra = "　←　不在声明的位置，是在候选位置找到的" if i.get("elsewhere") else ""
+                print(f"    位置：{shrink(i['path'])}{extra}")
+            elif i["remote_want"]:
+                print(f"    没找到，可 import：{i['remote_want']}")
+            if i.get("remote"):
+                print(f"    远端：{i['remote']}")
+            print(f"    {i['note']}")
+            print()
+        return 0
+
+    if args.action == "import":
+        for m in sel:
+            i = mem_info(m)
+            name = i["name"]
+            if i["path"]:
+                print(f"  跳过 {name}：已经在 {shrink(i['path'])}"
+                      f"（import 只负责把缺的取回来，不覆盖已有的）")
+                continue
+            if not m.get("remote"):
+                print(f"  跳过 {name}：没有远端，无法自动恢复")
+                continue
+            dest = expand(m["path"])
+            print(f"  clone {m['remote']} → {shrink(dest)}")
+            if args.dry_run:
+                continue
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            rc, out = git("clone", m["remote"], dest, cwd=os.path.dirname(dest))
+            print("    OK" if rc == 0 else f"    失败：{out}")
+        return 0
+
+    if args.action == "save":
+        for m in sel:
+            i = mem_info(m)
+            name, path = i["name"], i["path"]
+            if not path:
+                print(f"  跳过 {name}：没找到")
+                continue
+            if i["state"] == "未纳入版本控制":
+                print(f"  跳过 {name}：还不是 git 仓库")
+                continue
+            if not i.get("dirty"):
+                print(f"  {name}：没有改动")
+            else:
+                git("add", "-A", cwd=path)
+                rc, out = git("commit", "-m", args.message, cwd=path)
+                print(f"  {name}：{'已提交' if rc == 0 else '提交失败 ' + out[:80]}")
+            if i.get("remote") and args.push:
+                rc, out = git("push", cwd=path)
+                print(f"  {name}：{'已推送' if rc == 0 else '推送失败 ' + out[:120]}")
+            elif args.push:
+                print(f"  {name}：没有远端，跳过推送")
+        return 0
+    return 0
+
+
 # ---------------------------------------------------------------- setup 流水线
 
 def ask(prompt: str, default: str = "y") -> bool:
@@ -996,6 +1162,15 @@ def main() -> int:
     v.add_argument("--dry-run", "-n", action="store_true", help="只说要做什么，不动手")
     v.add_argument("--yes", action="store_true", help="卸载全部时需要")
     v.set_defaults(func=cmd_services)
+
+    m = sub.add_parser("memory", help="个人工作记忆：在哪、有没有备份、取回来")
+    m.add_argument("action", choices=["status", "import", "save"])
+    m.add_argument("name", nargs="*", help="只处理这些，不给就是全部")
+    m.add_argument("--config", "-c", help="指定配置文件")
+    m.add_argument("--dry-run", "-n", action="store_true", help="只说要做什么")
+    m.add_argument("--push", action="store_true", help="save 之后推到远端")
+    m.add_argument("--message", "-m", default="memory: 定期落盘", help="save 的提交信息")
+    m.set_defaults(func=cmd_memory)
 
     args = ap.parse_args()
     return args.func(args)

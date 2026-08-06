@@ -1,0 +1,61 @@
+# 个人工作记忆在哪 · 模板
+#
+#     cp memory.example.yaml _local-memory.yaml
+#     ./fleet_up.py memory status
+#     ./fleet_up.py memory import        # 新机器上把记忆取回来
+#     ./fleet_up.py memory save --push   # 定期落盘
+#
+# ── 为什么单独有这一层 ──
+#
+# 拓扑、角色、服务都能从版本库重建，唯独**记忆**不能：now/todo/waiting/decisions
+# 这些是这套系统真正的内容，而它们按设计被排除在方法论仓库之外
+# （workos 是照「可公开的方法论」建的，workspace/ 一直在 .gitignore 里，
+# 它的 README 明写着不要用 git add -f 绕过去）。
+#
+# 所以正确的做法不是去掀那条 gitignore，而是：**记忆放进单独的私人仓库，
+# 这里只记录它在哪。** 这份文件本身不含任何记忆内容，只有位置。
+#
+# ── path 和 also ──
+#
+# `path` 是首选位置，`also` 是「可能在的地方」，按顺序找。
+# 这个顺序表存在的理由：换台机器、或者哪天目录挪了位置，工具应该**先去找**，
+# 而不是当作不存在、然后在一个新位置开始干活——那会制造第二份真相，
+# 两边都有内容、都不完整，之后再也说不清哪份是对的。
+#
+# ── 字段 ──
+#   name     命令行点名用
+#   what     一句话说清这里装的是什么（status 会显示，方便判断值不值得抢救）
+#   path     首选位置
+#   also     可能在的地方，按顺序找
+#   remote   私有仓库地址。**必须是私有的**——这些内容含真实姓名、内部项目名、
+#            绩效材料，不能进任何公开仓库
+
+version: 1
+
+memory:
+  # 运行状态：Main Agent 的当前焦点、待办、等待、已定的决策、人员对照表。
+  # 这是最不该丢的一份——决策文件里是「为什么这么定、放弃了什么替代方案」，
+  # 丢了就只能重新踩一遍坑。
+  - name: workspace
+    what: now / todo / waiting / someday / decisions / people / inbox
+    path: ~/workos/workspace
+    also:
+      - ~/.workos/workspace
+      - ~/Documents/workos/workspace
+    remote: git@github.com:<你的账号>/workos-memory.git
+
+  # 日报 / 周报 / handoff。已经是独立仓库、有自己的历史，接个远端就行，
+  # 不要并进上面那个——并了会丢 commit 历史。
+  - name: journal
+    what: 日报 / 周报 / handoff 归档
+    path: ~/work/journal
+    also:
+      - ~/journal
+      - ~/workos/journal
+    remote: git@github.com:<你的账号>/workos-journal.git
+
+  # 日报草稿。定时任务生成的中间产物，丢了明天会重新生成，
+  # 所以**故意不给远端**——不是所有东西都值得备份。
+  - name: drafts
+    what: 定时任务生成的日报草稿（可再生，不必备份）
+    path: ~/.claude/journal
