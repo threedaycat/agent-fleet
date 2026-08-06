@@ -138,7 +138,7 @@ git clone <本仓库> && cd dingtalk-watch
 ./fleet_up.py setup        # 九步流水线
 ```
 
-`setup` 是一条**交互式流水线**：八步，每步先自检，已完成的自动打勾跳过，
+`setup` 是一条**交互式流水线**：九步，每步先自检，已完成的自动打勾跳过，
 没完成的停下来问你一句。任何时候 Ctrl-C 都能退，下次跑接着来。
 
 有几步注定**不能一键**，流水线不假装能——它停下来把该办的事讲清楚，等你办完按回车：
@@ -149,8 +149,8 @@ git clone <本仓库> && cd dingtalk-watch
 | `config.json` | 里面是你自己的 open_dingtalk_id / 关注群 / 路由表，换个人全不一样 |
 | hooks 合并 | 要**并进** `~/.claude/settings.json`，不是覆盖——那文件里还有你自己的配置 |
 
-其余五步（依赖检查、launchd 装常驻、生成 `_local-fleet.yaml`、角色文件核对、
-把会话拉起来）流水线自己干。
+其余六步（依赖检查、launchd 装常驻、生成 `_local-fleet.yaml`、角色文件核对、
+取回个人记忆、把会话拉起来）流水线自己干。
 
 ### 拓扑与角色（`fleet_up.py`）
 
@@ -185,7 +185,7 @@ git clone <本仓库> && cd dingtalk-watch
 > 踩过的坑：detached 建 session 不给 `-x/-y`，tmux 按 80x24 算，`main-vertical` 的
 > 主 pane 默认就要 80 列，**其余 pane 被压成 1 列宽**（实测 78x24 / 1x12 / 1x11）。
 > 命令照常送达执行，只是显示成一列一个字，看上去像「没送进去」；attach 上来也不会
-> 自动重排。`build_window()` 现在按当前 client 尺寸建，没 client 就用 204x60。
+> 自动重排。`build_window()` 现在按当前 client 尺寸建，没 client 就用 280x80。
 > 另外定位 pane 一律用 pane-id（`%NN`），不用 `session:window.index`——window 名会被
 > hook 加状态图标、随时会指错地方（§4 也是这么定的）。
 
