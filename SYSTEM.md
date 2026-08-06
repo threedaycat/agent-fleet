@@ -135,7 +135,7 @@ python3 dtcc.py say "..."                     # 主动往手机播报一条（�
 
 ```bash
 git clone <本仓库> && cd dingtalk-watch
-./fleet_up.py setup
+./fleet_up.py setup        # 九步流水线
 ```
 
 `setup` 是一条**交互式流水线**：八步，每步先自检，已完成的自动打勾跳过，
@@ -220,6 +220,35 @@ picker 键位在 claude-tmux-sessions 的 install.sh（默认 `prefix+g`）。
 > `./data/x.out` 被解析成 `/data/x.out`，写不进去、进程照常起、日志一个字没有，
 > 看上去像「定时任务根本没跑」。现在 `cwd`/`log`/`cmd[0]` 一律转绝对路径
 > （相对路径按仓库目录解析）。
+
+### 个人工作记忆（`fleet_up.py memory`）
+
+拓扑、角色、服务都能从版本库重建，**唯独记忆不能**——而记忆才是这套系统真正的内容。
+
+不能把它塞进 workos：那个仓库是照「可公开的方法论」建的（`f772937 Initialize
+public-safe Work OS`），`workspace/` 一直在它的 `.gitignore` 里，README 明写着
+不要用 `git add -f` 绕过去。所以**记忆进单独的私人仓库，这一层只记录它在哪**，
+`memory.example.yaml` 本身不含任何记忆内容。
+
+```bash
+./fleet_up.py memory status        # 在哪、是不是独立仓库、有没有远端、有没有未提交
+./fleet_up.py memory import        # 新机器上把记忆取回来（已存在的一律跳过，不覆盖）
+./fleet_up.py memory save --push   # 定期落盘
+```
+
+`path` 是首选位置，`also` 是**可能在的地方**，按顺序找。这个顺序表存在的理由：
+换台机器或目录挪了位置，工具应该先去找，而不是当作不存在、然后在一个新位置开始
+干活——那会制造第二份真相，两边都有内容、都不完整，之后再也说不清哪份是对的。
+
+声明里**不给 `remote` 就是明说这份不打算备份**（可再生的中间产物），
+status 显示「不备份」，不计入告警。
+
+> 踩过的坑（两条都属于「检查看起来在工作，其实报的是假的」，比没有检查更危险）：
+> 一、只问 `git rev-parse --git-dir` 会一路往上走。在 `~/workos/workspace` 里问，
+> 它找到父仓库的 `.git` 就答「是」，于是报出来的 commit 数和脏文件数全是**父仓库的**，
+> 看上去有备份、其实完全没有。要比对 `--show-toplevel` 是不是目录本身。
+> 二、判断「是否被父仓库忽略」时拿**目录**去 `check-ignore` 会答「没挡」，
+> 因为常见写法是 `workspace/*`（挡内容、放过目录本身）。要拿里面的实际文件去问。
 
 ### 控制台（`console.py`）
 
