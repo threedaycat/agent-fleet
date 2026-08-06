@@ -71,6 +71,16 @@ services:
     calendar:
       - {weekday: 5, hour: 17, minute: 30}
 
+  # 控制台页面。浏览器开一个标签页常驻，页面自己会重载。
+  # 它本身也归这一层管——不然又变成一个「机器上跑着但没人知道谁装的」的东西。
+  - name: console
+    label: com.workos.console
+    cmd: ["/usr/bin/python3", "./console.py", "--loop", "10", "--fast"]
+    cwd: .
+    log: ./data/console.out
+    keepalive: true
+    run_at_load: true
+
   # 别让机器睡着，否则夜里的定时任务全部顺延到你早上开盖那一刻。
   # -s 只在插电时生效；合盖仍然会睡，这个 caffeinate 拦不住。
   - name: caffeinate

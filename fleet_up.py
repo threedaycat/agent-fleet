@@ -353,6 +353,31 @@ def cmd_up(args) -> int:
 
 # ---------------------------------------------------------------- check
 
+def live_windows(sess: str) -> set[str]:
+    out = tmux("list-windows", "-t", sess, "-F", "#{window_name}", check=False)
+    return {clean_window_name(x) for x in out.splitlines() if x}
+
+
+def session_diff(cfg: dict, name: str) -> tuple[str, str]:
+    """一个 session 的声明与现实对账，返回 (状态, 说明)。
+
+    只检查「声明的 window 在不在」，**不管多出来的**。同一个 tmux session 里
+    除了 workOS 本体的窗口，通常还开着一堆随项目生灭的窗口（临时排查、某个仓库的
+    开发窗口）——那些本来就不该进配置，按 window 数量比对会永远报差异，
+    等于这个检查天天喊狼来了，久了就没人看了。
+    """
+    want = set()
+    for s in cfg.get("sessions") or []:
+        if s["name"] == name:
+            want |= {w.get("name") for w in (s.get("windows") or []) if w.get("name")}
+    live = live_windows(name)
+    missing = sorted(want - live)
+    extra = len(live - want)
+    if missing:
+        return "差异", f"缺 window：{'、'.join(missing)}" + (f"（另有 {extra} 个额外窗口，正常）" if extra else "")
+    return "OK", f"{len(want)} 个声明窗口都在" + (f"，另有 {extra} 个额外窗口" if extra else "")
+
+
 def cmd_check(args) -> int:
     cfg = load_cfg(args.config)
     live = set(live_sessions())
@@ -360,19 +385,12 @@ def cmd_check(args) -> int:
     print(f"配置：{cfg['_path']}")
     for n in sorted(want | live):
         if n in want and n in live:
-            mark, note = "OK  ", ""
-            w_want = sum(len(s.get("windows") or [])
-                         for s in cfg["sessions"] if s["name"] == n)
-            w_live = len([x for x in tmux(
-                "list-windows", "-t", n, "-F", "#{window_index}", check=False
-            ).splitlines() if x])
-            if w_want != w_live:
-                mark, note = "差异", f"（配置 {w_want} 个 window，实际 {w_live} 个）"
-            print(f"  {mark} {n} {note}")
+            mark, note = session_diff(cfg, n)
+            print(f"  {mark:<4} {n}  {note}")
         elif n in want:
             print(f"  缺   {n}（配置里有，机器上没有 → fleet_up.py up --session {n}）")
         else:
-            print(f"  野生 {n}（机器上有，配置里没有 → capture 一下或删掉）")
+            print(f"  野生 {n}（机器上有、配置里没有——项目会话通常就该是这样）")
     return 0
 
 
@@ -416,15 +434,31 @@ def cmd_doctor(args) -> int:
     else:
         print("  (没有配置，跳过)")
 
-    print("\nlaunchd 常驻")
+    print("\n服务（launchd）")
+    svcs = load_svc()
+    if not svcs:
+        print(f"  (没有 services 配置，模板在 {os.path.basename(EXAMPLE_SVC)})")
+    for s in svcs:
+        name = s.get("name", "?")
+        st, note = svc_status(s)
+        # push-loop 只在 remote on（出门遥控）时才该跑，桌前不跑是正常的，不判失败
+        if s.get("label", "").endswith(".push"):
+            print(f"  (-) {name}  {'在跑' if st in ('OK', '托管') else '没跑（桌前正常）'}")
+            continue
+        line(st in ("OK", "托管"), name, note or (f"状态：{st}" if st != "OK" else ""))
+
+    # 机器上跑着、但任何配置都没提到的 launchd 任务：换台机器不会自动有。
+    # 这是「部署缺口」，不是「坏了」，所以只提示不判失败。
+    declared = {s.get("label") for s in svcs}
     loaded = subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout
-    for label in ("com.workos.dtwatch.at", "com.workos.dtwatch.poll"):
-        line(label in loaded, label)
-    # push-loop 只在 remote on（出门遥控）时才该跑，桌前不跑是正常的，所以不判失败
-    print(f"  (-) com.workos.dtwatch.push  {'在跑' if 'dtwatch.push' in loaded else '没跑（桌前正常）'}")
-    for label in ("com.workos.report.daily", "com.workos.report.weekly", "com.workos.caffeinate"):
-        if label in loaded:
-            print(f"  (?) {label}  在跑，但仓库里没有装它的脚本 —— 换机器不会自动有")
+    stray: list[str] = []
+    for ln in loaded.splitlines():
+        parts = ln.split("\t")
+        label = parts[-1].strip() if parts else ""
+        if label.startswith("com.workos.") and label not in declared:
+            stray.append(label)
+    for label in stray:
+        print(f"  (?) {label}  在跑，但没有任何配置声明它 —— 换机器不会自动有")
 
     print("\n" + ("自检通过。" if ok else "有缺项，见上面未打勾的。"))
     return 0 if ok else 1
