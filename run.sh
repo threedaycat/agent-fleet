@@ -32,15 +32,18 @@ LA_DIR="$HOME/Library/LaunchAgents"
 # launchd label 前缀。反向域名只是 launchd 的习惯，随便改成你自己的都行 ——
 # 改了记得先 `./run.sh uninstall` 卸掉旧 label，否则会留下卸不掉的僵尸 plist。
 #
-# 默认值必须跟这台机器上 ~/Library/LaunchAgents/ 里实际装的 plist 一致——
-# 2026-08-01 发现这里曾经默认 local.dtwatch，但机器上装的是 com.workos.dtwatch
-# 前缀（谁装的、什么时候装的已经查不到了），导致 `status` 的 launchd_loaded()
-# 永远查错 label、永远判断成"没有 launchd 托管"。后果不是显示错误这么简单：
-# 每次巡检看到"托管方式：手工"就照着 TRIAGE.md 的指示 `./run.sh start`，
-# 于是在 launchd 已经在跑的三个进程之上，又叠了一遍 at-stream/poll-loop/
-# push-loop——多份进程同时轮询同一份 dws token、同时写同一份 data/state.json，
-# 这才是当晚 last_poll_took_s 涨到 600+ 秒、"采集器可能停了"反复报警的真正原因，
-# 不是采集器真的挂了。
+# ⚠️ 这个值必须跟这台机器上 ~/Library/LaunchAgents/ 里实际装的 plist 一致。
+# 2026-08-01 踩过：仓库里默认写的是一个前缀，机器上装的却是另一个，
+# 导致 `status` 的 launchd_loaded() 永远查错 label、永远判断成"没有 launchd 托管"。
+# 后果不是显示错误这么简单：每次巡检看到"托管方式：手工"就照着 TRIAGE.md 的指示
+# `./run.sh start`，于是在 launchd 已经在跑的三个进程之上，又叠了一遍
+# at-stream/poll-loop/push-loop——多份进程同时轮询同一份 dws token、同时写同一份
+# data/state.json，这才是当晚 last_poll_took_s 涨到 600+ 秒、"采集器可能停了"
+# 反复报警的真正原因，不是采集器真的挂了。
+#
+# 所以前缀**跟机器绑定，不跟仓库绑定**：本机实际用的写进 `_local-env.sh`
+# （`_local-*` 已在 .gitignore 里），仓库里只留一个通用默认值。
+[ -f "$BASE/_local-env.sh" ] && . "$BASE/_local-env.sh"
 LABEL_PREFIX="${DTWATCH_LABEL_PREFIX:-com.workos.dtwatch}"
 LABEL_AT="$LABEL_PREFIX.at"
 LABEL_POLL="$LABEL_PREFIX.poll"

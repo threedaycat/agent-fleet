@@ -458,13 +458,17 @@ def cmd_doctor(args) -> int:
 
     # 机器上跑着、但任何配置都没提到的 launchd 任务：换台机器不会自动有。
     # 这是「部署缺口」，不是「坏了」，所以只提示不判失败。
-    declared = {s.get("label") for s in svcs}
+    #
+    # 「该管哪些 label」从你自己声明的 label 里推出来（取前两段作命名空间），
+    # 不写死任何前缀——写死就等于把某个人的命名习惯焊进通用工具里。
+    declared = {s.get("label") for s in svcs if s.get("label")}
+    namespaces = {".".join(x.split(".")[:2]) + "." for x in declared if x.count(".") >= 2}
     loaded = subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout
     stray: list[str] = []
     for ln in loaded.splitlines():
         parts = ln.split("\t")
         label = parts[-1].strip() if parts else ""
-        if label.startswith("com.workos.") and label not in declared:
+        if label not in declared and any(label.startswith(n) for n in namespaces):
             stray.append(label)
     for label in stray:
         print(f"  (?) {label}  在跑，但没有任何配置声明它 —— 换机器不会自动有")
