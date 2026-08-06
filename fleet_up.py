@@ -434,6 +434,15 @@ def cmd_doctor(args) -> int:
     else:
         print("  (没有配置，跳过)")
 
+    print("\n个人工作记忆")
+    mems = load_mem()
+    if not mems:
+        print(f"  (没有 memory 配置，模板在 {os.path.basename(EXAMPLE_MEM)})")
+    for m in mems:
+        i = mem_info(m)
+        # 「不备份」是声明里明说的选择，不算缺项
+        line(i["state"] in ("OK", "不备份"), i["name"], i["note"])
+
     print("\n服务（launchd）")
     svcs = load_svc()
     if not svcs:
@@ -742,10 +751,15 @@ def mem_info(m: dict) -> dict:
     # 它会找到父仓库 ~/workos 的 .git 然后回答「是」，于是 status 报出来的
     # commit 数和脏文件数全是父仓库的——一个看起来有备份、其实完全没有的假象。
     # （2026-08-06 实测：workspace 被报成「有未提交 3 个文件」，那 3 个是 workos 的。）
+    # 声明里没给 remote = 明说了这份不打算备份（可再生的中间产物）。
+    # 对这种还报「删了就没了」是假警报——检查一旦开始喊狼来了，久了就没人看了。
+    expendable = not m.get("remote")
+
     rc, top = git("rev-parse", "--show-toplevel", cwd=found)
     if rc != 0:
-        d["state"] = "未纳入版本控制"
-        d["note"] = "改了什么、什么时候改的都没有记录，删了就没了"
+        d["state"] = "不备份" if expendable else "未纳入版本控制"
+        d["note"] = ("声明里没给远端，按可再生处理" if expendable
+                     else "改了什么、什么时候改的都没有记录，删了就没了")
         return d
     if os.path.realpath(top) != os.path.realpath(found):
         d["state"] = "未纳入版本控制"
@@ -770,8 +784,9 @@ def mem_info(m: dict) -> dict:
     d["commits"] = cnt if cnt.isdigit() else "0"
 
     if not d["remote"]:
-        d["state"] = "只在本机"
-        d["note"] = f"{d['commits']} 个 commit，但没有远端——这台机器没了就全没了"
+        d["state"] = "不备份" if expendable else "只在本机"
+        d["note"] = (f"{d['commits']} 个 commit，声明里没给远端，按可再生处理" if expendable
+                     else f"{d['commits']} 个 commit，但没有远端——这台机器没了就全没了")
     elif d["dirty"]:
         d["state"] = "有未提交"
         d["note"] = f"{d['dirty']} 个文件改了没提交"
@@ -1048,6 +1063,43 @@ class StepRoles(Step):
         return self.done()
 
 
+class StepMemory(Step):
+    title = "个人工作记忆（从私人仓库取回来）"
+
+    def _pending(self) -> list[dict]:
+        """需要 import 的：声明了远端、但本机哪个候选位置都没找到。"""
+        return [m for m in load_mem() if m.get("remote") and not find_memory(m)]
+
+    def done(self) -> bool:
+        return os.path.isfile(LOCAL_MEM) and not self._pending()
+
+    def why(self) -> str:
+        return ("拓扑和服务能从版本库重建，记忆不能——它在单独的私人仓库里，"
+                "这一步把它取回来。")
+
+    def do(self) -> bool:
+        if not os.path.isfile(LOCAL_MEM):
+            if not os.path.isfile(EXAMPLE_MEM):
+                return False
+            if ask("从 memory.example.yaml 复制一份 _local-memory.yaml？"):
+                shutil.copy(EXAMPLE_MEM, LOCAL_MEM)
+                print(f"    已生成 {LOCAL_MEM}——把里面的仓库地址改成你自己的私人仓库。")
+            pause("改好了吗")
+            if not os.path.isfile(LOCAL_MEM):
+                return False
+        todo = self._pending()
+        if not todo:
+            return True
+        print("    这些在本机找不到，可以从远端取回：")
+        for m in todo:
+            print(f"      - {m.get('name')}  ←  {m.get('remote')}")
+        if not ask("现在 import？"):
+            return False
+        cmd_memory(argparse.Namespace(action="import", name=[m["name"] for m in todo],
+                                      config=None, dry_run=False, push=False, message=""))
+        return self.done()
+
+
 class StepUp(Step):
     title = "把会话拉起来"
 
@@ -1072,7 +1124,7 @@ class StepUp(Step):
 
 SETUP_STEPS = [
     StepDeps, StepAuth, StepConfig, StepHooks,
-    StepLaunchd, StepFleetCfg, StepRoles, StepUp,
+    StepLaunchd, StepFleetCfg, StepRoles, StepMemory, StepUp,
 ]
 
 

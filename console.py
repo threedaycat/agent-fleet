@@ -159,6 +159,23 @@ def collect_topology() -> list[dict]:
     return rows
 
 
+def collect_memory() -> list[dict]:
+    """个人工作记忆有没有备份。
+
+    放在控制台里的理由：拓扑、服务、角色出问题都能从版本库重建，唯独记忆不能。
+    它最该被盯着，也最容易因为「一直没事」而被忘掉。
+    """
+    out = []
+    for m in fleet_up.load_mem():
+        i = fleet_up.mem_info(m)
+        out.append({
+            "name": i["name"], "state": i["state"], "what": i.get("what", ""),
+            "where": fleet_up.shrink(i["path"]) if i["path"] else "（没找到）",
+            "note": i["note"],
+        })
+    return out
+
+
 def collect_events(n: int) -> list[dict]:
     """events.ndjson 末尾 n 条，倒序。
 
@@ -238,8 +255,9 @@ def collect_collector() -> list[dict]:
 # ---------------------------------------------------------------- 渲染
 
 TONE = {
-    "OK": "ok", "托管": "ok", "常驻": "ok",
+    "OK": "ok", "托管": "ok", "常驻": "ok", "不备份": "mute",
     "差异": "warn", "漂移": "warn", "缺": "warn", "未装": "warn",
+    "只在本机": "bad", "未纳入版本控制": "bad", "没找到": "bad",
     "野生": "mute", "不一致": "bad", "配置错": "bad", "读不了": "bad",
 }
 
@@ -267,13 +285,16 @@ def render(args) -> str:
     topo = collect_topology()
     checks = collect_checks()
     coll = collect_collector()
+    mems = collect_memory()
     events = collect_events(args.events)
 
     bad_checks = [c for c in checks if not c["ok"]]
     bad_svcs = [s for s in svcs if s["state"] not in ("OK", "托管")]
     bad_topo = [t for t in topo if t["state"] in ("缺", "差异")]
     warn_coll = [c for c in coll if c.get("warn")]
-    trouble = len(bad_checks) + len(bad_svcs) + len(bad_topo) + len(warn_coll)
+    bad_mem = [m for m in mems if m["state"] not in ("OK", "不备份")]
+    trouble = (len(bad_checks) + len(bad_svcs) + len(bad_topo)
+               + len(warn_coll) + len(bad_mem))
 
     head = (f'<span class="{"bad" if trouble else "ok"}">'
             f'{"有 %d 处要看" % trouble if trouble else "一切正常"}</span>'
@@ -325,6 +346,12 @@ def render(args) -> str:
                 table(["", "名字", "触发", "说明"], srows)),
         section("拓扑对账", "「野生」对项目会话是正常的",
                 table(["", "session", "说明"], trows)),
+        section("个人工作记忆", "别的都能从版本库重建，这个不能",
+                table(["", "名字", "内容", "位置", "说明"],
+                      [[pill(m["state"]), esc(m["name"]),
+                        f'<span class="mute">{esc(m["what"])}</span>',
+                        f'<code>{esc(m["where"])}</code>',
+                        f'<span class="mute">{esc(m["note"])}</span>'] for m in mems])),
         section("自检", "", table(["", "项", "说明"], crows)),
         section("采集器", "", table(["", ""], grows)),
         section("事件流", f"events.ndjson 最近 {len(events)} 条，会话之间的共享记忆",
