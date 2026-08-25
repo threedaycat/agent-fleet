@@ -386,28 +386,42 @@ def must_arrive(rec: dict) -> bool:
     return "at_me" in (rec.get("flags") or [])
 
 
-def cmd_for_session(cfg, args):
-    """吐出「归本会话、该投给它」的条目，并记账防重复投递。
+# 投递优先级的档位。以前是 cmd_for_session 里的一个局部字典，
+# 抽出来是因为判据搬到了 select_for_session，两边得共用同一份。
+LEVEL_ORDER = {"high": 0, "normal": 1, "low": 2}
 
-    dtcc 的 Stop hook 调这个：会话一收尾就问一句「有我的活吗」，
-    有就把它注入回去接着干。--peek 只看不记账。
+
+def select_for_session(records, cfg, session, level, triage, ledger, at):
+    """挑出「归这个会话、此刻该投给它」的条目。**纯判据：不读文件、不看时钟。**
+
+    抽出来的理由跟 tmux_probe 抽屏幕抓取一样，是这条判据错了会**静默漏事**：
+    幂等破了就是同一条任务投两次（收尾一次塞一遍，刷屏）；反过来收得太死就是
+    黑洞 —— 老实现 `if r["id"] in ledger: continue` 只要投过一次就永远不再投，
+    实测有一条投出去没人接住，挂了 25 小时才被发现，而且**全程不报错**。
+
+    原来这段判据长在 `cmd_for_session` 里，跟 `read_inbox()` / `load_json` /
+    `now()` / `print` 缠在一起，要测就得写 `data/` 下的生产文件。现在四样外部
+    状态全从参数进来：`records`（收件箱）、`triage`（处置台账）、
+    `ledger`（投递台账）、`at`（现在）。测试给一个固定时刻，就能不等真实
+    15 分钟地验重投窗口。
+
+    返回 `[(rec, label, prev_stamp)]`；`prev_stamp` 非空表示这是一次**重投**，
+    调用方据此写日志。**不改 rec** —— 打 `route_label` 留给调用方，
+    这样这个函数拿同一批记录跑两次结果一样。
     """
-    triage = load_json(TRIAGE, {})
-    ledger = load_json(INJECTED, {})
-    order = {"high": 0, "normal": 1, "low": 2}
-    want = order[args.level]
+    want = LEVEL_ORDER[level]
     out = []
-    for r in read_inbox():
+    for r in records:
         sid, label = route_of(r, cfg)
-        if sid != args.session:
+        if sid != session:
             continue
         # 不把 low 塞给项目会话 —— 日报卡片、CI 推送、文件消息刷屏没意义
-        if order.get(r.get("level", "low"), 2) > want:
+        if LEVEL_ORDER.get(r.get("level", "low"), 2) > want:
             continue
         t = triage.get(r["id"], {})
         if t.get("status") in ("done", "ignored"):
             continue
-        if t.get("status") == "snoozed" and t.get("until", "") > ts(now()):
+        if t.get("status") == "snoozed" and t.get("until", "") > ts(at):
             continue
         prev = ledger.get(r["id"])
         if prev:
@@ -421,19 +435,49 @@ def cmd_for_session(cfg, args):
             if not must_arrive(r):
                 continue          # 非必达类保持老行为：投一次就算了，不刷屏
             try:
-                waited = (now() - parse_ts(prev)).total_seconds()
+                waited = (at - parse_ts(prev)).total_seconds()
             except ValueError:
                 waited = REDELIVER_AFTER_MINUTES * 60      # 时间戳坏了当成该重投
             if waited < REDELIVER_AFTER_MINUTES * 60:
                 continue          # 刚投过，别每次收尾都塞一遍
+        out.append((r, label, prev or ""))
+    return out
+
+
+def stamp_delivered(ledger, records, at):
+    """把这一批记进投递台账。下一轮 `select_for_session` 就靠它判重。
+
+    单独一个函数是为了让「投一次 → 记账 → 再问一次」这个循环能在内存里跑完，
+    不用碰 `data/injected.json`。
+    """
+    stamp = ts(at)
+    for r in records:
+        ledger[r["id"]] = stamp
+    return ledger
+
+
+def cmd_for_session(cfg, args):
+    """吐出「归本会话、该投给它」的条目，并记账防重复投递。
+
+    dtcc 的 Stop hook 调这个：会话一收尾就问一句「有我的活吗」，
+    有就把它注入回去接着干。--peek 只看不记账。
+
+    判据在 `select_for_session` 里，这里只剩 IO：读两个台账、写日志、
+    记账、打印。
+    """
+    triage = load_json(TRIAGE, {})
+    ledger = load_json(INJECTED, {})
+    at = now()
+    out = []
+    for r, label, prev in select_for_session(
+            read_inbox(), cfg, args.session, args.level, triage, ledger, at):
+        if prev:
             logline(f"[for-session] 重投 {r['id'][:14]} "
                     f"（上次 {prev}，至今无 triage 记录）")
         r["route_label"] = label
         out.append(r)
     if out and not args.peek:
-        stamp = ts(now())
-        for r in out:
-            ledger[r["id"]] = stamp
+        stamp_delivered(ledger, out, at)
         save_json(INJECTED, ledger)
     for r in out:
         print(json.dumps(r, ensure_ascii=False))
