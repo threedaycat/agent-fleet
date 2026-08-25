@@ -1,0 +1,251 @@
+"""entitled() / owner_of_quote() 的测试 —— 「这条手机指令该不该由我执行」。
+
+错了同样**不报错**：指令被别的会话吃掉，他在手机上看到贴了 OK，
+以为有人在干，实际上干的是不相干的那个会话，或者压根没人干。
+
+铁律（2026-07-30 定，写在 target_of 的文档里）：收件人**永远是主会话**，
+只有「引用了某条播报」和「文字里点名了会话标签」两个例外。
+「按上一个说话的会话」这条规则已经整个删掉 —— 它跟消息内容毫无关系、纯靠运气，
+实测把两条自检消息派给了不相干的项目会话。下面有一个用例专门钉这件事。
+
+全部用 `dtcc.FakeRoutes` 跑，不碰 `data/cc/state.json`，也不碰 fleet / tmux。
+
+跑：python3 -m unittest discover -s tests -v
+"""
+
+import inspect
+import os
+import sys
+import unittest
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import dtcc
+
+
+MAIN = "7ac5aaaa-1111-2222-3333-444455556666"
+PROJ = "3f21bbbb-1111-2222-3333-444455556666"
+OTHER = "9d0ccccc-1111-2222-3333-444455556666"
+
+CFG = {"cc": {"main_session": MAIN}}
+
+LONG = "这是一条很长的播报开头用来撑过四十个字的边界" * 3   # 63 字
+
+
+def bc(sid, text):
+    """造一条播报环记录，head 的算法跟 note_broadcast 一致。"""
+    return {"sid": sid, "head": dtcc.head_of(text), "at": "2026-08-25 10:00:00"}
+
+
+def routes(broadcasts=None, panes=None):
+    sessions = {sid: {"pane": pane} for sid, pane in (panes or {}).items()}
+    return dtcc.FakeRoutes(broadcasts=broadcasts, sessions=sessions)
+
+
+class OwnerOfQuote(unittest.TestCase):
+    def test_原文一致就归发它的会话(self):
+        src = routes([bc(PROJ, "【CC 3f21】接口联调完了，等你确认")])
+        self.assertEqual(
+            dtcc.owner_of_quote("【CC 3f21】接口联调完了，等你确认", src), PROJ)
+
+    def test_钉钉把引用截断了也要认出来(self):
+        """钉钉引用长消息时只带前面一截。认不出来 = 这条回复被当成新指令，
+        默认派回主会话，而他明明是在回项目会话那条播报。"""
+        src = routes([bc(PROJ, "【CC 3f21】" + LONG)])
+        self.assertEqual(dtcc.owner_of_quote("【CC 3f21】" + LONG[:18], src), PROJ)
+
+    def test_引用里换行被压成空格也认得出(self):
+        """head_of 会把连续空白归一成一个空格；引用带回来的换行不能算不一致。"""
+        src = routes([bc(PROJ, "【CC 3f21】第一行 第二行")])
+        self.assertEqual(dtcc.owner_of_quote("【CC 3f21】第一行\n\n  第二行", src), PROJ)
+
+    def test_同一段话播报过两次归最近那条(self):
+        """从后往前找。归错了就是指令进了一个可能已经关掉的老会话。"""
+        src = routes([bc(PROJ, "【CC】日报草稿好了"), bc(OTHER, "【CC】日报草稿好了")])
+        self.assertEqual(dtcc.owner_of_quote("【CC】日报草稿好了", src), OTHER)
+
+    def test_认不出来返回空(self):
+        """认不出就该退回默认收件人，绝不能瞎猜一个 —— 猜错就是派错人。"""
+        src = routes([bc(PROJ, "【CC 3f21】接口联调完了")])
+        self.assertEqual(dtcc.owner_of_quote("完全不相干的一句话", src), "")
+
+    def test_空引用返回空(self):
+        self.assertEqual(dtcc.owner_of_quote("", routes([bc(PROJ, "【CC】x")])), "")
+        self.assertEqual(dtcc.owner_of_quote("   \n ", routes([bc(PROJ, "【CC】x")])), "")
+
+    def test_播报环是空的返回空(self):
+        self.assertEqual(dtcc.owner_of_quote("【CC】随便什么", routes([])), "")
+
+    def test_跳过head为空的脏记录(self):
+        """环里混进一条 head 空的记录，不能让它匹配上所有引用。"""
+        src = routes([{"sid": OTHER, "head": ""}, bc(PROJ, "【CC】正经播报")])
+        self.assertEqual(dtcc.owner_of_quote("【CC】正经播报", src), PROJ)
+
+    def test_前四十字相同就算命中_已知的宽边界(self):
+        """现有行为：只比前 40 字。两条播报开头一样、结尾不同会被认成同一条。
+
+        这不是新加的判据，是把现状钉下来 —— 真要收紧得先有人拍板，
+        改了会影响所有「引用截断」的正常路径。
+        """
+        src = routes([bc(PROJ, LONG + "甲"), bc(OTHER, LONG + "乙")])
+        self.assertEqual(dtcc.owner_of_quote(LONG + "甲", src), OTHER)
+
+
+class NamedSession(unittest.TestCase):
+    def test_点名四位会话标签(self):
+        src = routes(panes={MAIN: "%1", PROJ: "%2"})
+        self.assertEqual(dtcc.named_session(CFG, "3f21 那个接口先别动", src), PROJ)
+
+    def test_大小写不敏感(self):
+        src = routes(panes={MAIN: "%1", PROJ: "%2"})
+        self.assertEqual(dtcc.named_session(CFG, "3F21 那个接口先别动", src), PROJ)
+
+    def test_标签嵌在长串里不算点名(self):
+        """要独立成词。否则一段 uuid 或哈希里凑巧含这四个字符，
+        整条指令就被劫给一个他压根没提的会话。"""
+        src = routes(panes={MAIN: "%1", PROJ: "%2"})
+        self.assertEqual(dtcc.named_session(CFG, "日志里有个 ab3f21cd 的串", src), "")
+
+    def test_项目名不算点名(self):
+        """收紧过一次：原来也认项目短名，结果他天天提项目名 ——
+        「项目A 那个先别推」是在跟主会话聊天，却被劫给了那个项目会话。"""
+        src = routes(panes={MAIN: "%1", PROJ: "%2"})
+        self.assertEqual(dtcc.named_session(CFG, "项目A 那个先别推", src), "")
+
+    def test_文字为空返回空(self):
+        self.assertEqual(dtcc.named_session(CFG, "", routes(panes={PROJ: "%2"})), "")
+
+
+class Entitled(unittest.TestCase):
+    def test_认不出自己就放行(self):
+        """拿不到 sid 时退回旧行为，绝不能把整条遥控通道锁死。"""
+        self.assertEqual(dtcc.entitled(CFG, {"text": "看一下"}, "", routes()),
+                         (True, "no-sid"))
+
+    def test_默认收件人是主会话(self):
+        src = routes(panes={MAIN: "%1", PROJ: "%2"})
+        ok, why = dtcc.entitled(CFG, {"text": "看一下进度"}, MAIN, src)
+        self.assertTrue(ok)
+        self.assertEqual(why, "mine(default→main)")
+
+    def test_不是给我的就不许拿(self):
+        """项目会话不能吃掉本该主会话处理的指令 —— 这是「指令被别的会话吃掉」的主线。"""
+        src = routes(panes={MAIN: "%1", PROJ: "%2"})
+        ok, why = dtcc.entitled(CFG, {"text": "看一下进度"}, PROJ, src)
+        self.assertFalse(ok)
+        self.assertEqual(why, "belongs-to-7ac5(default→main)")
+
+    def test_主人的pane没了才放开(self):
+        """主人的 pane 真的不在了（会话表里查不到）才让别人捡，
+        否则这条指令会永远卡在一个不存在的会话名下。"""
+        src = routes(panes={PROJ: "%2"})          # MAIN 不在会话表里
+        ok, why = dtcc.entitled(CFG, {"text": "看一下进度"}, PROJ, src)
+        self.assertTrue(ok)
+        self.assertEqual(why, "owner-pane-gone(7ac5)")
+
+    def test_pane字段是空串也算没了(self):
+        src = routes(panes={MAIN: "", PROJ: "%2"})
+        ok, why = dtcc.entitled(CFG, {"text": "看一下进度"}, PROJ, src)
+        self.assertTrue(ok)
+        self.assertEqual(why, "owner-pane-gone(7ac5)")
+
+    def test_没配主会话就谁来谁接(self):
+        """没人可派的时候放行，别把通道弄死。
+
+        这条路径上 `target_of` 会写一行日志到 `data/cc/cc.log` —— 判据函数里
+        还留着一处 IO，这次按规矩没改它（改了就是动现有行为），改用 mock 挡住。
+        **不挡的话这个测试会往生产日志里写字**，是审计钩子（`tests/_audit_run.py`）
+        抓出来的，肉眼和 mtime 对比都看不出来（后台 push-loop 每 8 秒写同一行）。
+        """
+        src = routes(panes={PROJ: "%2"})
+        with mock.patch.object(dtcc, "logline") as logged:
+            ok, why = dtcc.entitled({"cc": {}}, {"text": "看一下进度"}, PROJ, src)
+        self.assertTrue(ok)
+        self.assertEqual(why, "unrouted")
+        self.assertEqual(logged.call_count, 1)      # 没人可派这件事必须留痕
+
+    def test_引用了播报就归播报的主人(self):
+        src = routes([bc(PROJ, "【CC 3f21】接口联调完了")], panes={MAIN: "%1", PROJ: "%2"})
+        cmd = {"text": "那就发吧", "quoted_text": "【CC 3f21】接口联调完了"}
+        self.assertEqual(dtcc.entitled(CFG, cmd, PROJ, src), (True, "mine(quote)"))
+        ok, why = dtcc.entitled(CFG, cmd, MAIN, src)
+        self.assertFalse(ok)
+        self.assertEqual(why, "belongs-to-3f21(quote)")
+
+    def test_引用认不出就退回主会话(self):
+        """认不出的引用不能顺势派给「最近说话的那个」—— 那正是错派的病根。"""
+        src = routes([bc(PROJ, "【CC 3f21】接口联调完了")], panes={MAIN: "%1", PROJ: "%2"})
+        cmd = {"text": "那就发吧", "quoted_text": "一条根本没播报过的话"}
+        self.assertEqual(dtcc.entitled(CFG, cmd, MAIN, src), (True, "mine(default→main)"))
+
+    def test_点名优先于默认但引用优先于点名(self):
+        """他既引用了 A 的播报又在文字里打了 B 的标签时，以引用为准 ——
+        引用是明确在回那条消息，标签可能只是顺口提到。"""
+        src = routes([bc(PROJ, "【CC 3f21】接口联调完了")],
+                     panes={MAIN: "%1", PROJ: "%2", OTHER: "%3"})
+        cmd = {"text": "9d0c 也一起看看", "quoted_text": "【CC 3f21】接口联调完了"}
+        self.assertEqual(dtcc.entitled(CFG, cmd, PROJ, src), (True, "mine(quote)"))
+        cmd2 = {"text": "9d0c 也一起看看"}
+        self.assertEqual(dtcc.entitled(CFG, cmd2, OTHER, src), (True, "mine(named)"))
+
+    def test_别人刚播报过也不改变收件人(self):
+        """钉死「按上一个说话的会话」这条规则已经删掉：
+        环里最后一条是 OTHER 发的，但他没引用，指令照样归主会话。"""
+        src = routes([bc(OTHER, "【CC 9d0c】我这边跑完了")],
+                     panes={MAIN: "%1", OTHER: "%3"})
+        ok, why = dtcc.entitled(CFG, {"text": "那先这样"}, OTHER, src)
+        self.assertFalse(ok)
+        self.assertEqual(why, "belongs-to-7ac5(default→main)")
+
+
+class 死会话仍带着pane_已知缺口(unittest.TestCase):
+    """把一个**没修**的缺口钉下来，免得下次有人以为它已经被处理过了。
+
+    `pane_of()` 只问「会话表里这个 sid 有没有 pane 值」，不问「这个 pane 还在不在
+    tmux 里」。2026-08-25 实测：`fleet.sessions()` 返回 106 个会话，其中 **45 个**
+    `known=gone / state=closed`，但**仍然带着 pane 值**（例 `464f4f8d → %134`，
+    `%134` 早就不在 `tmux list-panes` 里了）。
+
+    后果是两条，都静默：
+      1. `entitled()` 一路返回 `belongs-to-464f`，指令卡在一个已经关掉的会话名下 ——
+         「主人的 pane 真的没了才放开」那条后路**对这 45 个永远不会触发**。
+      2. `named_session()` 的候选池里含这 45 个已关闭会话，他打一个死会话的 4 位
+         标签，指令就被判给一个不存在的收件人。
+
+    修它要么在 `pane_of` 里加一次存活校验（会改现有行为），要么先做台账回收 ——
+    两条都超出「纯抽层」的边界，所以这次只钉现状、写进汇报。
+    """
+
+    def test_会话表给了pane就当主人还在(self):
+        src = routes(panes={MAIN: "%134", PROJ: "%2"})   # %134 其实早没了，会话表不知道
+        ok, why = dtcc.entitled(CFG, {"text": "看一下进度"}, PROJ, src)
+        self.assertFalse(ok)
+        self.assertEqual(why, "belongs-to-7ac5(default→main)")
+
+    def test_已关闭的会话照样能被点名(self):
+        src = routes(panes={MAIN: "%1", OTHER: "%134"})   # OTHER 已关闭
+        self.assertEqual(dtcc.named_session(CFG, "9d0c 处理一下", src), OTHER)
+
+
+class NoSpeakerRule(unittest.TestCase):
+    """结构性约束：路由判据不许去问「最后说话的是谁」。
+
+    两个函数的文档里都写着「没有 speaker 规则」，但文档拦不住下一次手滑 ——
+    这两个用例拦得住：只要有人在判据里调回 speaker_sid()，测试就红。
+    """
+
+    def test_target_of不问最后说话的是谁(self):
+        self.assertNotIn("speaker_sid(", inspect.getsource(dtcc.target_of))
+
+    def test_entitled不问最后说话的是谁(self):
+        self.assertNotIn("speaker_sid(", inspect.getsource(dtcc.entitled))
+
+    def test_假路由源不提供speaker(self):
+        """FakeRoutes 只给播报环和会话表两样东西。多给一样，
+        判据就有机会偷偷用上它。"""
+        self.assertFalse(hasattr(dtcc.FakeRoutes(), "speaker"))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import time
+from typing import Protocol
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(HERE, "config.json")
@@ -426,12 +427,77 @@ def speaker_sid(max_age: float = 0) -> str:
     return sid
 
 
-def owner_of_quote(quoted_text: str) -> str:
-    """他引用的那条播报是谁发的。认不出来返回空。"""
+# ---------------------------------------------------------------- 路由的 IO 接缝
+#
+# 「这条指令归谁」要问两处**生产状态**：播报环（`data/cc/state.json`）和会话表
+# （`fleet.sessions()`，真相在 `~/.claude/tmux-claude-status.json`）。判据直接
+# 长在这两处上面就等于不可测 —— 跟屏幕抓取那层是同一个病，`tmux_probe.py` 已经
+# 治过一次。照抄那边的两条：
+#
+#   A. **判据做成只吃数据的纯函数**（`match_*`），喂什么算什么，不猜、不读盘。
+#   B. **IO 藏在 `RouteSource` 后面**，真假两个实现；测试只用假的，
+#      所以永远不会读写 `data/`。
+#
+# 为什么必须是「双后端做全套」而不是「只给播报环做个内存版」：播报环走内存、
+# 会话表还读真文件的话，测试之间就会共享本机 tmux 的真实状态 ——
+# 今天开了几个会话，`named_session` 的结果就变几次。
+
+
+class RouteSource(Protocol):
+    """路由判据要用到的全部外部状态。真实现读盘，假实现吃内存。"""
+
+    def broadcasts(self) -> list: ...
+    def sessions(self) -> dict: ...
+
+
+class LiveRoutes(object):
+    """真实现。"""
+
+    def broadcasts(self):
+        return load_json(STATE, {}).get("broadcasts", []) or []
+
+    def sessions(self):
+        # 老行为：fleet 导不进来（比如 tmux 状态文件坏了）就当**一个会话都没有**，
+        # 不抛给调用方 —— 抛了会把整条遥控通道打死。
+        try:
+            return fleet_mod().sessions() or {}
+        except Exception:                          # noqa: BLE001
+            return {}
+
+
+class FakeRoutes(object):
+    """假实现。**测试里唯一该用的东西**，不碰 `data/`、不碰 fleet、不碰 tmux。
+
+    `broadcasts` 按时间顺序给（最新的在最后），跟 `note_broadcast` 往环里
+    append 的顺序一致。
+    """
+
+    def __init__(self, broadcasts=None, sessions=None):
+        self._broadcasts = list(broadcasts or [])
+        self._sessions = dict(sessions or {})
+
+    def broadcasts(self):
+        return list(self._broadcasts)
+
+    def sessions(self):
+        return dict(self._sessions)
+
+
+def _routes(source):
+    return source if source is not None else LiveRoutes()
+
+
+# ---------------------------------------------------------------- 纯判据
+
+def match_broadcast(broadcasts, quoted_text: str) -> str:
+    """在播报环里认出这条引用的主人。**纯函数。**认不出来返回空。
+
+    从后往前找 —— 同一段话可能播报过多次，他引用的总是最近那条。
+    """
     h = head_of(quoted_text)
     if not h:
         return ""
-    for b in reversed(load_json(STATE, {}).get("broadcasts", [])):
+    for b in reversed(list(broadcasts)):
         bh = b.get("head", "")
         if not bh:
             continue
@@ -441,7 +507,28 @@ def owner_of_quote(quoted_text: str) -> str:
     return ""
 
 
-def entitled(cfg, cmd: dict, sid: str) -> tuple[bool, str]:
+def match_named_session(session_ids, text: str) -> str:
+    """他在这段文字里点名了哪个会话。**纯函数。**认不出返回空。
+
+    判据本身见 `named_session` 的文档 —— 只认 4 位会话标签，且要独立成词。
+    """
+    if not text:
+        return ""
+    low = text.lower()
+    for sid in session_ids:
+        tag = sid[:4].lower()
+        # 要独立成词才算：免得别的 uuid 片段或长串里恰好含这 4 个字符
+        if re.search(rf"(?<![0-9a-z]){re.escape(tag)}(?![0-9a-z])", low):
+            return sid
+    return ""
+
+
+def owner_of_quote(quoted_text: str, source=None) -> str:
+    """他引用的那条播报是谁发的。认不出来返回空。"""
+    return match_broadcast(_routes(source).broadcasts(), quoted_text)
+
+
+def entitled(cfg, cmd: dict, sid: str, source=None) -> tuple[bool, str]:
     """这条指令该不该由我这个会话执行。
 
     跟 target_of 用同一套铁律（2026-07-30 定）：收件人默认永远是主会话，
@@ -451,12 +538,13 @@ def entitled(cfg, cmd: dict, sid: str) -> tuple[bool, str]:
     """
     if not sid:
         return True, "no-sid"          # 认不出自己，退回旧行为，不要把通道弄死
-    target, why = target_of(cfg, cmd)
+    source = _routes(source)
+    target, why = target_of(cfg, cmd, source)
     if not target:
         return True, "unrouted"        # 没人可派，谁来谁接，别把通道弄死
     if target == sid:
         return True, f"mine({why})"
-    if pane_of(target):
+    if pane_of(target, source):
         return False, f"belongs-to-{sid_tag(target)}({why})"
     # 主人的 pane 真的没了（status.json 里查不到）才放开，
     # 否则这条指令会永远卡在一个不存在的会话名下。
@@ -644,7 +732,7 @@ def fleet_mod():
     return fleet
 
 
-def pane_of(sid: str) -> str:
+def pane_of(sid: str, source=None) -> str:
     """这个会话在哪个 tmux pane。返回稳定的 `%NN`，查不到返回空。
 
     用 `%NN` 而不是 `session:window.index` —— 后者会随着窗口移动/改名变，
@@ -653,13 +741,10 @@ def pane_of(sid: str) -> str:
     """
     if not sid:
         return ""
-    try:
-        return (fleet_mod().sessions().get(sid) or {}).get("pane", "") or ""
-    except Exception:                              # noqa: BLE001
-        return ""
+    return (_routes(source).sessions().get(sid) or {}).get("pane", "") or ""
 
 
-def target_of(cfg, cmd: dict) -> tuple[str, str]:
+def target_of(cfg, cmd: dict, source=None) -> tuple[str, str]:
     """这条手机指令归哪个会话。返回 (sid, 判断依据)。
 
     跟 entitled() 是同一套规则，只是这里要**主动算出目标**而不是回答
@@ -673,13 +758,14 @@ def target_of(cfg, cmd: dict) -> tuple[str, str]:
     「按上一个说话的会话」这条规则已经整个删掉：它跟消息内容毫无关系、纯靠运气，
     正是错派的病根（实测有两条自检消息就是这么被派给了不相干的项目会话）。
     """
+    source = _routes(source)
     main = (cfg.get("cc") or {}).get("main_session") or ""
     quoted = cmd.get("quoted_text") or ""
     if quoted:
-        owner = owner_of_quote(quoted)
+        owner = owner_of_quote(quoted, source)
         if owner:
             return owner, "quote"
-    named = named_session(cfg, cmd.get("text") or "")
+    named = named_session(cfg, cmd.get("text") or "", source)
     if named:
         return named, "named"
     if main:
@@ -688,7 +774,7 @@ def target_of(cfg, cmd: dict) -> tuple[str, str]:
     return "", "unrouted"
 
 
-def named_session(cfg, text: str) -> str:
+def named_session(cfg, text: str, source=None) -> str:
     """他在文字里点名了某个会话吗。**只认 4 位会话标签**（如 `7ac5`）。
 
     收紧过一次：原来也认项目短名（「项目A 那边先停」→ 项目A 会话），
@@ -699,19 +785,9 @@ def named_session(cfg, text: str) -> str:
 
     认不出返回空 —— 走默认（主会话），不猜。
     """
-    if not text:
+    if not text:                       # 老行为：文字为空就不去问会话表，省一次读盘
         return ""
-    low = text.lower()
-    try:
-        sess = fleet_mod().sessions()
-    except Exception:                              # noqa: BLE001
-        return ""
-    for sid in sess:
-        tag = sid[:4].lower()
-        # 要独立成词才算：免得别的 uuid 片段或长串里恰好含这 4 个字符
-        if re.search(rf"(?<![0-9a-z]){re.escape(tag)}(?![0-9a-z])", low):
-            return sid
-    return ""
+    return match_named_session(_routes(source).sessions(), text)
 
 
 def push_seen(mid: str, sig: str) -> bool:
