@@ -103,199 +103,55 @@ def env_sid() -> str:
             or os.environ.get("CLAUDE_SESSION_ID") or "").strip()
 
 
-MAX_ENTER_RETRIES = 3      # 回车补发的上限——宁可放弃也别死循环往人家输入框塞字
-ENTER_RETRY_WAIT = 0.6     # 每次补发后等多久再回读
-BASE_SEND_DELAY = 0.4      # 短文本的基础延时
-PER_CHAR_DELAY = 0.001     # 每个字符多等多久（长文本按长度线性加）
-MAX_SEND_DELAY = 3.0       # 延时上限，别为了超长文本无限等
+# 屏幕抓取那一层搬到了 tmux_probe.py —— 抽出去的理由和五种说谎方式见那个文件的
+# 模块文档，判据的测试在 tests/test_tmux_probe.py。这里只保留函数名，因为
+# console.py / dtcc.py / picker_items.py / board_html.py 都按这些名字在调。
+# **别在这里重新实现任何判据**，那会立刻变成第二份真相。
+from tmux_probe import (                                          # noqa: E402
+    MAX_ENTER_RETRIES, ENTER_RETRY_WAIT, BASE_SEND_DELAY,
+    PER_CHAR_DELAY, MAX_SEND_DELAY, PaneProbe,
+)
+
+
+from tmux_probe import TmuxScreen                                   # noqa: E402
+
+_SCREEN = TmuxScreen()
+
+
+def _probe(pane: str) -> PaneProbe:
+    return PaneProbe(pane, screen_source=_SCREEN)
 
 
 def tmux_send(pane: str, text: str) -> bool:
     """往指定 pane 发一段文字并回车。**唯一允许发 send-keys 的地方。**
-
-    四条防护，每条都是踩过的：
-      1. **pane 为空一律拒发**。`tmux send-keys` 不带 `-t` 会打到「当前活动 pane」——
-         2026-07-30 自测时就因为取 pane-id 的命令写错、target 变成空字符串，
-         把一条命令打进了别人正在看的 shell 里并执行了。宁可不发，不能乱发。
-      2. **只接受 pane-id（`%NN`）**，不接受 `session:window` 名 —— 会话改名后
-         按名字发会静默打空（`journal` 被改成 `OS` 那次就是）。
-      3. **文字和回车之间按文本长度动态停一下**。`-l` 把文字塞进输入框是异步的，
-         紧跟着发 Enter 会跟文字挤在一起，任务停在输入框里没提交，文本越长
-         越容易中——2026-08-01 实测：`capture-pane` 层面文字其实几乎立刻就
-         "看着"落定了（回读内容早就稳定），但 Claude Code 内部真正处理完
-         这段输入、进入"能接受 Enter＝提交"的状态明显更慢，固定 0.4s 对
-         长文本不够，得按长度动态加长（有上限，别无限等）。
-      4. **回车之后回读一次输入框，确认真的空了**。`send-keys` 返回 0 只说明
-         tmux 把按键送进了 pane，不保证 Claude Code 真的收下了回车——
-         2026-08-01 凌晨实测两次：077601b8 卡了 54 分钟、33a78f55 卡了
-         79 分钟，文本进了输入框但没提交，会话就那么干等着，是中枢手工
-         再敲一次回车才动。"发出去了"不等于"提交了"，跟"send-keys
-         返回 0 不等于打对了 pane"是同一类坑。回读用 `pending_input_stable`
-         （单次 `pending_input` 会读到 `capture-pane` 的旧帧，5380 同一天
-         实测出的另一坑，见该函数文档）——没空就当没提交、补发一次
-         Enter，最多 `MAX_ENTER_RETRIES` 次，别死循环往人家输入框里塞字。
-         **这条是兜底，不是主力**——实测过单靠回车重试救不回来（应用没
-         就绪时，再敲几次 Enter 也没用，只有等第 3 条的动态延时到位才
-         真正提交得掉），真正起作用的是第 3 条；第 4 条留着是为了"提交
-         没提交"这件事不再靠猜、靠沉默的 `send-keys` 返回值——但它的
-         可靠性有上限：`pending_input_stable` 连续两次撞上同一帧旧值时
-         仍会给出错误答案，这里没有更强的判据可用。
-    """
-    if not pane or not pane.startswith("%"):
-        return False
-    if not pane_alive(pane):
-        return False
-    code, _ = sh(["tmux", "send-keys", "-t", pane, "-l", text])
-    if code != 0:
-        return False
-    time.sleep(min(MAX_SEND_DELAY, BASE_SEND_DELAY + len(text) * PER_CHAR_DELAY))
-    for _ in range(MAX_ENTER_RETRIES):
-        code, _ = sh(["tmux", "send-keys", "-t", pane, "Enter"])
-        if code != 0:
-            return False
-        time.sleep(ENTER_RETRY_WAIT)
-        stable = pending_input_stable(pane)
-        if stable == "":
-            return True
-        # stable is None（读不准）或非空字符串（确实还没提交）都继续重试
-    return pending_input_stable(pane) == ""
+    四条防护（拒空 pane、只认 %NN、按长度动态延时、回车后回读确认）
+    都在 tmux_probe.PaneProbe.send 里，连出处一起。"""
+    return _probe(pane).send(text)
 
 
 def pending_input(pane: str) -> str:
-    """输入框里有没有已经打进去、但还没敲回车提交的文字。
-
-    背景：`/compact` 送进输入框是**下一轮开头才真正执行**的——中间只要再
-    wake 一次，新任务会占掉那一轮，压缩指令就被冲掉了，会话继续涨，谁都
-    不知道（2026-07-31 晚上真实发生两次：077601b8 送了 /compact 又被派活，
-    401k 才被自己发现；297b11d9 585k 时 /compact 发出但数字没降）。
-    靠派活的人记得先看一眼不可靠，所以在 wake 里机械挡一道。
-
-    Claude Code 的输入框是个方框，提示符是 "❯ "；正常时提示符后面啥都
-    没有。方框上边框是带标题的 "──── 项目名 ──"，下边框是纯 "─" 一行。
-    有文字排着没提交时,提示符和下边框之间会有内容——扫到下边框为止,
-    别只看提示符那一行,免得长文本换行漏看。
-    """
-    if not pane or not pane.startswith("%"):
-        return ""
-    code, out = sh(["tmux", "capture-pane", "-t", pane, "-p", "-S", "-20"])
-    if code != 0:
-        return ""
-    lines = out.splitlines()
-    prompt_i = None
-    for i, ln in enumerate(lines):
-        if ln.strip().startswith("❯"):
-            prompt_i = i          # 取最后一次出现，避免历史输出里凑巧带这个符号
-    if prompt_i is None:
-        return ""
-    buf = []
-    first = lines[prompt_i].strip()[1:].strip()
-    if first and first != "Press up to edit queued messages":
-        # "Press up to edit queued messages" 不是没提交的文字，是提交成功、
-        # 对方正忙、消息已排队的提示——2026-08-01 5380 实测：wake 发给一个
-        # 正忙的会话（%25），消息确实排队成功了，但这行提示被当成"框里还有
-        # 字"，导致 wake 判定发送失败、报了假阴性。当成空，别当成待提交内容。
-        buf.append(first)
-    for ln in lines[prompt_i + 1:]:
-        s = ln.strip()
-        if not s or s == "Press up to edit queued messages":
-            continue
-        if re.fullmatch(r"─+", s):        # 下边框：到此为止
-            break
-        buf.append(s)
-    return " ".join(buf).strip()
+    """输入框里有没有打进去但没提交的文字。**单次抓屏，会读到旧帧。**"""
+    return _probe(pane).pending_input()
 
 
 def pending_input_stable(pane: str, gap: float = 0.4):
-    """`pending_input` 单次抓屏靠不住,连抓两次、一致才采信。
-
-    2026-08-01 5380 实测踩出的新坑:`capture-pane` 会返回**旧帧**——
-    `send-keys -l` 发完立刻抓,抓到的还是发之前那帧;隔一次工具调用再抓
-    才显出新内容。反过来,清空之后抓到"已空",下一次又变回清空前的旧帧。
-    这条对 `tmux_send` 的第 4 条回读护栏是致命的:单次抓屏可能读到"发送前
-    的旧帧还有字"→ 误判没提交 → 多补一次回车 → 可能把下一条消息错误提交;
-    也可能读到"清空前的旧帧是空的"→ 误判已提交 → 退出重试循环,又回到
-    要修的那个 bug,而且这次带着"已回读确认"的假象,比原来更难发现。
-
-    做法:间隔 `gap` 抓两次,一致才当真;不一致就返回 None,表示"读不准",
-    调用方必须自己决定不确定时怎么办,不能当成确定的空或确定的非空。
-    这不是万能药——两次都撞上同一帧旧值的概率不为零,只是把误判概率
-    从"每次都可能撞上"降到"连续两次都撞上同一个错帧",值得记录这个
-    可靠性上限,不能写成"已解决"。
-    """
-    a = pending_input(pane)
-    time.sleep(gap)
-    b = pending_input(pane)
-    return a if a == b else None
+    """连抓两次一致才采信；读不准返回 None。调用方必须自己处理 None。"""
+    return _probe(pane).pending_input_stable()
 
 
 def capture_tail(pane: str, n: int = 6) -> str:
-    """只拿 pane 最后 n 行——不管当前可见区多高、滚动到哪，永远是"此刻
-    最新"这几行。
-
-    2026-08-01 5380 实测：`ctx_usage` 原来带 `-S -15` 往上翻 scrollback，
-    抓到过旧页脚（报 89k 实际 336k，报 658k 实际 126k）——拿这个字段
-    判断该不该催压缩，字段错了调度就是错的，是三个问题里最要紧那条。
-
-    **`-S` 的行号是相对可见区顶部数的，不是相对底部**——一开始想用
-    `-S -{n} -E -` 精确取尾部，结果 pane 矮的时候看着像只拿了尾部
-    （凑巧），pane 高的时候照样把整个可见区（实测一个 46 行高的 pane）
-    都带回来，验证时当场露馅。改成"整块可见区先原样拿回来，Python 这边
-    自己切最后 n 行"，就不受 pane 高度影响了。
-    """
-    if not pane or not pane.startswith("%"):
-        return ""
-    code, out = sh(["tmux", "capture-pane", "-t", pane, "-p"])
-    if code != 0:
-        return ""
-    return "\n".join(out.splitlines()[-n:])
+    """pane 最后 n 行，不受可见区高度和滚动位置影响。"""
+    return _probe(pane).tail(n)
 
 
 def awaiting_choice(pane: str) -> bool:
-    """对面是不是正停在一个交互选择框上（AskUserQuestion 那种），不是在等文字输入。
-
-    2026-08-01 5380 指出：这跟 `pending_input` 防的不是一回事——那个防的是
-    "输入框有字没提交"，这个防的是"根本不在输入框，Claude 正等你在选择框
-    里按键"。硬发文字进去会被当成对选择框的按键响应，可能替他确认了一件
-    本该他自己点头的事（发消息确认、权限确认、危险命令确认——机主的硬
-    规矩正是这些必须他本人点头）。这不是体验问题，是会踩红线的坑。
-
-    检测特征直接抄 `desk_push.sh` 的 `desk_busy()`——那套在生产里跑了很久，
-    同一套系统里 desk 那条注入路径早就防了这个，`fleet.py wake` 没防，
-    没防的这条还是天天在用的那条，没有理由自己重新发明一遍。
-
-    只看 `capture_tail`（最后几行），不看整块可见区——2026-08-01 5380
-    实测过：原来 `capture-pane -p` 拿的是整块可见区，如果那块里有人
-    回显过 "Enter to select" 这几个字（比如自己在 grep 它们、或者这段
-    文字本来就是任务原文的一部分被打印在屏幕上），会被当成真的停在
-    选择框上，误拒正常派活。这条失败方向是安全的（拒发不是硬发），
-    但会莫名其妙挡掉本该正常放行的派活。
-    """
-    out = capture_tail(pane)
-    if not out:
-        return False
-    return bool(re.search(r"Enter to select|↑/↓ to navigate|Esc to cancel", out))
+    """对面是不是停在交互选择框上（硬发文字会替人点头，会踩红线）。"""
+    return _probe(pane).awaiting_choice()
 
 
 def ctx_usage(pane: str):
-    """从页脚那行解析上下文占用，形如 "529k (53%)"。
-
-    页脚格式参考：`[Opus 5 (1M context)] 项目名  ▓▓▓░░ 53% (529k)  ⚠⚠ /compact now`。
-    解析不到就返回 None——**不猜、不报错**，页脚格式以后要是变了，这里
-    应该老实说"不知道"，不该给一个可能是错的数字出去。
-
-    只看 `capture_tail`（最后几行），不带 `-S` 往上翻 scrollback——见
-    `capture_tail` 文档里 2026-08-01 那次"读到滚动区旧页脚"的实测
-    （报 89k 实际 336k，报 658k 实际 126k）。就算尾部里凑巧出现不止
-    一个百分比，取最后一个匹配——那个才是离当前最近的。
-    """
-    out = capture_tail(pane)
-    if not out:
-        return None
-    matches = re.findall(r"(\d+)%\s*\((\d+k)\)", out)
-    if not matches:
-        return None
-    pct, kk = matches[-1]
-    return f"{kk} ({pct}%)"
+    """页脚里的上下文占用，形如 "529k (53%)"；解析不到返回 None，不猜。"""
+    return _probe(pane).ctx_usage()
 
 
 def sh(args: list[str], timeout=5) -> tuple[int, str]:
@@ -309,10 +165,8 @@ def sh(args: list[str], timeout=5) -> tuple[int, str]:
 # ---------------------------------------------------------------- tmux
 
 def live_panes() -> set:
-    """tmux 里**现在真实存在**的 pane-id 集合。一次拿全，不逐个查（有 68 个）。"""
-    code, out = sh(["tmux", "list-panes", "-a", "-F", "#{pane_id}"])
-    return set(out.split()) if code == 0 else set()
-
+    """tmux 里现在真实存在的 pane-id 集合。一次拿全，不逐个查。"""
+    return _SCREEN.live_panes()
 
 def sessions(include_remembered: bool = True) -> dict:
     """session_id -> 会话实况。
@@ -486,35 +340,11 @@ def tmux_target() -> str:
 
 
 def pane_alive(target: str) -> bool:
-    """target 传 **pane-id（%NN）** 最稳。
-
-    别用 `session:window` 那种名字型 target —— tmux 会话随时会被改名
-    （2026-07-30 `journal` 就被改成了 `OS`），名字一变，按名字发的 send-keys
-    直接打空，而且不报错。pane-id 改名、挪窗口、换 index 都不变。
-    """
-    if not target:
-        return False
-    code, out = sh(["tmux", "display-message", "-p", "-t", target, "#{pane_id}"])
-    return code == 0 and out.startswith("%")
-
+    """target 传 pane-id（%NN）最稳——会话改名后按名字发会静默打空。"""
+    return _SCREEN.alive(target)
 
 def pane_tail(target: str, lines=4) -> str:
-    code, out = sh(["tmux", "capture-pane", "-p", "-t", target])
-    if code != 0:
-        return ""
-    return "\n".join(out.splitlines()[-lines:])
-
-
-
-
-
-# ---------------------------------------------------------------- 收尾话的全文
-
-# 会话之间互相打招呼用的标记，形如 `@7ac5`（对方会话号）或 `@main`（项目短名）。
-# 这东西是**中断线**：主会话靠它知道"这句话在叫我"。所以哪怕收尾话很长、
-# 标记落在第 300 字，也必须进事件 —— 截断把它切掉，中断线就静默失灵了。
-MARK_RE = re.compile(r"@(?:[0-9a-f]{4,8}|[A-Za-z][\w-]{1,14})")
-
+    return _probe(target).tail(lines)
 
 def tail_text(path: str, kb: int = 512) -> list[str]:
     """只读文件末尾若干 KB 的完整行。transcript 能有几十 MB，不能整读。"""
