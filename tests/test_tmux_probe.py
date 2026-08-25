@@ -19,9 +19,9 @@ def screen(*lines):
     return "\n".join(lines)
 
 
-BOX_TOP = "──── zymix ──────────────────────────"
+BOX_TOP = "──── demo ───────────────────────────"
 BOX_BOT = "─────────────────────────────────────"
-FOOTER = "[Opus 5 (1M context)] zymix  ▓▓▓░░ 53% (529k)  ⚠⚠ /compact now"
+FOOTER = "[Opus 5 (1M context)] demo  ▓▓▓░░ 53% (529k)  ⚠⚠ /compact now"
 
 
 class PendingInput(unittest.TestCase):
@@ -83,8 +83,8 @@ class CtxUsage(unittest.TestCase):
     def test_滚动区旧页脚取最后一个_b466a64(self):
         """原来带 -S -15 往上翻 scrollback，抓到过旧页脚：报 89k 实际 336k、
         报 658k 实际 126k。尾部里出现不止一个百分比时，最后一个才离当前最近。"""
-        two = screen("[Opus 5] zymix ▓░ 9% (89k)", "中间的输出",
-                     "[Opus 5] zymix ▓▓▓ 34% (336k)")
+        two = screen("[Opus 5] demo ▓░ 9% (89k)", "中间的输出",
+                     "[Opus 5] demo ▓▓▓ 34% (336k)")
         self.assertEqual(tp.parse_ctx_usage(two), "336k (34%)")
 
     def test_解析不到就说不知道(self):
