@@ -355,12 +355,93 @@ def read_at_events(state):
 # 项目A 那个会话手里接着干，而不是全堆到哨兵这一个会话里由我转述。
 # config.json 的 `route` 就是这张表：会话名 或 发送人名 → 目标 session id。
 
-def route_of(rec: dict, cfg) -> tuple[str, str]:
+# ------------------------------------------------------------- 会话态路由
+#
+# 静态路由（下面 `route_of` 查的 config.json `route` 表）回答的是
+# 「**这个人 / 这个群**归哪个会话」—— 按身份、手工配，现在 5 条。
+#
+# 它答不了另一个问题：「**我发出去的那条私聊，回信归谁**」。发的那一刻
+# 没有留下任何登记，所以回信来了无从归属。实测（2026-08-25）全部历史
+# 759 条单聊里 **602 条（79%）无人接**，涉及 32 个私聊通道；它们落回哨兵
+# 视图 —— 也就是「给人看」，没有任何会话拿到。Claude 私聊完一个同事等回话，
+# 回信 100% 走这条路，而且**全程不报错**。
+#
+# 这一层补的就是那件事。钥匙是 `cid`（钉钉的通道 id，14194 条记录每条都有）。
+# 机制跟 `dtcc.note_broadcast` 的播报环是同一个形状 —— 发的时候记一笔，
+# 回来的时候认回原主。区别只在钥匙：播报环用「文本指纹 + 对方引用了」，
+# 而同事私聊回你时不会引用。
+
+def match_awaiting(claims, rec: dict, at) -> tuple[str, str]:
+    """这条消息落在哪条「在等回信」的登记上。**纯判据：不读盘、不看时钟。**
+
+    `claims` 形状 `[{"cid":…, "sid":…, "label":…, "until":…}]`，按登记顺序给、
+    **最新的在最后** —— 跟播报环同一个约定。`at` 是「现在」，从参数进来，
+    所以测过期不用真的等。
+
+    返回 `(session_id, 标签)`，认不出返回 `("", "")`。
+
+    三条判据，各自钉住一种会**静默漏事**的情况：
+
+    1. **只认 `cid`，不认名字。** 名字会重名、会改，群名会被人改；`cid` 是
+       钉钉给的通道 id。按名字认，就会把张三的回信投给在等李三的那个会话。
+    2. **`until` 缺了算不命中**，不是算永不过期。失败方向是故意选的：
+       漏路由 → 落回哨兵视图，人还看得见；而一条写坏的登记若永不过期，
+       就是**永久劫持**这个通道，且不报错。宁可漏，不可劫持。
+    3. **从后往前找，后登记的赢。** 两个会话同时等同一个人时的规则，
+       跟 `match_broadcast`（「他引用的总是最近那条」）保持一致。
+
+    **判死不在这里做。** 登记的会话可能已经没了，而那个结论只有
+    `fleet.build_sessions()` 拿 `tmux list-panes` 算得出来（写在 `known`
+    字段里）。这里再问一遍 tmux 就是第二份真相，而且等于给一个刚被证明
+    可测的纯判据重新加上 IO —— 理由跟 `dtcc.routable_sessions` 逐字相同。
+    **剔掉死会话的登记是调用方的事。**
+    """
+    cid = rec.get("cid") or ""
+    if not cid:
+        return "", ""
+    stamp = ts(at)
+    for c in reversed(list(claims or ())):
+        if (c.get("cid") or "") != cid:
+            continue
+        sid = c.get("sid") or ""
+        if not sid:
+            continue                        # 写坏的登记不该把这个通道弄死
+        until = c.get("until") or ""
+        # 边界跟 select_for_session 的 snooze 同一套：`until > 现在` 才算还有效，
+        # 所以「正好到点」算过期。今天上午在「满 15 分钟重投」上栽过同一个边界。
+        if not until or until <= stamp:
+            continue
+        return sid, c.get("label") or ""
+    return "", ""
+
+
+def route_of(rec: dict, cfg, claims=None, at=None) -> tuple[str, str]:
     """这条消息归哪个 Claude 会话。返回 (session_id, 标签)，没配就是 ("","")。
 
-    先按群/单聊名字匹配，再按发送人名字匹配 —— 这样既能整个需求群路由过去，
-    也能只把某个人的私聊路由过去。
+    顺序：先看「在等回信」的登记，再按群/单聊名字匹配，最后按发送人名字匹配 ——
+    这样既能整个需求群路由过去，也能只把某个人的私聊路由过去，而 Claude 自己
+    发出去等回话的那条，回信能认回它自己。
+
+    **登记排在静态表之前。** 因为登记是「此刻正在进行的对话」，比手工配的
+    身份表更具体；反过来会让配过静态路由的人的回信永远走不到发起方。
+
+    `claims` 默认 `None` = 没有登记，行为跟加这一层之前**逐字相同**
+    （`test_routing.py` 那 14 个用例一行没改，这是刻意的）。
+
+    给了 `claims` 就必须给 `at`：过期判断绝不能让 route_of 自己看时钟 ——
+    它是纯函数，能测就因为这个。忘了给宁可**当场抛错**，也不要悄悄按
+    「永不过期」走，那就是判据 2 说的永久劫持。
     """
+    if claims:
+        if at is None:
+            raise ValueError(
+                "route_of: 给了 claims 就必须给 at —— 过期判断不能靠它自己看时钟")
+        sid, label = match_awaiting(claims, rec, at)
+        if sid:
+            # 登记没写 label 时退回对方的名字，跟静态表「用命中的那个 key 当标签」
+            # 一致。⚠️ 欠账：这样一来显示层分不出「静态路由」和「等回信」，
+            # 而 route_of 返回的是二元组，加第三个值会动到现有 14 个用例。
+            return sid, label or (rec.get("sender") or rec.get("conv") or "")
     routes = cfg.get("route") or {}
     for key in ((rec.get("conv") or ""), (rec.get("sender") or "")):
         if key and key in routes:
