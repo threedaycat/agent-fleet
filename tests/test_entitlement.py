@@ -38,8 +38,16 @@ def bc(sid, text):
     return {"sid": sid, "head": dtcc.head_of(text), "at": "2026-08-25 10:00:00"}
 
 
-def routes(broadcasts=None, panes=None):
-    sessions = {sid: {"pane": pane} for sid, pane in (panes or {}).items()}
+def routes(broadcasts=None, panes=None, dead=()):
+    """造一份假会话表。`dead` 里的 sid 是 pane 已经不在 tmux 里的那种 ——
+    记录还带着 pane 值（那是「上次见到它在哪」，第 3 层的记忆），
+    但 `known` 标着 gone。判死本身在 fleet.build_sessions 里做，这里只造结论。"""
+    sessions = {}
+    for sid, pane in (panes or {}).items():
+        r = {"pane": pane, "known": "live"}
+        if sid in dead:
+            r["known"] = "gone"
+        sessions[sid] = r
     return dtcc.FakeRoutes(broadcasts=broadcasts, sessions=sessions)
 
 
@@ -199,33 +207,52 @@ class Entitled(unittest.TestCase):
         self.assertEqual(why, "belongs-to-7ac5(default→main)")
 
 
-class 死会话仍带着pane_已知缺口(unittest.TestCase):
-    """把一个**没修**的缺口钉下来，免得下次有人以为它已经被处理过了。
+class 死会话不许当收件人(unittest.TestCase):
+    """2026-08-25 修掉的缺口。修之前 `pane_of()` 只问「会话表里有没有 pane 值」，
+    不问「这个 pane 还在不在 tmux 里」——实测 107 个会话里 **45 个** `known=gone`
+    却仍带着 pane 值（`464f4f8d → %134`，`%134` 早不在 `tmux list-panes` 里；
+    这 45 个里还有 2026-08-01 事故的 `%44` 和购票会话 `7ac5`，都是真用过的）。
 
-    `pane_of()` 只问「会话表里这个 sid 有没有 pane 值」，不问「这个 pane 还在不在
-    tmux 里」。2026-08-25 实测：`fleet.sessions()` 返回 106 个会话，其中 **45 个**
-    `known=gone / state=closed`，但**仍然带着 pane 值**（例 `464f4f8d → %134`，
-    `%134` 早就不在 `tmux list-panes` 里了）。
-
-    后果是两条，都静默：
-      1. `entitled()` 一路返回 `belongs-to-464f`，指令卡在一个已经关掉的会话名下 ——
-         「主人的 pane 真的没了才放开」那条后路**对这 45 个永远不会触发**。
-      2. `named_session()` 的候选池里含这 45 个已关闭会话，他打一个死会话的 4 位
-         标签，指令就被判给一个不存在的收件人。
-
-    修它要么在 `pane_of` 里加一次存活校验（会改现有行为），要么先做台账回收 ——
-    两条都超出「纯抽层」的边界，所以这次只钉现状、写进汇报。
+    后果是**指令静默消失**：活会话收到指令回一句「不是我的，是 464f 的」，
+    而 464f 早关了，`entitled()` 里「主人的 pane 真没了才放开」那条后路
+    永远不触发。三个用例分别钉住修好之后的三处表现。
     """
 
-    def test_会话表给了pane就当主人还在(self):
-        src = routes(panes={MAIN: "%134", PROJ: "%2"})   # %134 其实早没了，会话表不知道
+    def test_死会话查不到pane(self):
+        src = routes(panes={MAIN: "%134", PROJ: "%2"}, dead={MAIN})
+        self.assertEqual(dtcc.pane_of(MAIN, src), "")
+        self.assertEqual(dtcc.pane_of(PROJ, src), "%2")
+
+    def test_主人死了那条后路才真的能走(self):
+        src = routes(panes={MAIN: "%134", PROJ: "%2"}, dead={MAIN})
+        ok, why = dtcc.entitled(CFG, {"text": "看一下进度"}, PROJ, src)
+        self.assertTrue(ok)
+        self.assertEqual(why, "owner-pane-gone(7ac5)")
+
+    def test_死会话不进点名的候选池(self):
+        src = routes(panes={MAIN: "%1", OTHER: "%134"}, dead={OTHER})
+        self.assertEqual(dtcc.named_session(CFG, "9d0c 处理一下", src), "")
+
+    def test_活着的照样正常归属(self):
+        """修完不能矫枉过正 —— 12:01 那个方向的错误在这条链上的表现就是
+        「所有收件人一次性消失」，比原来的缺口更糟。"""
+        src = routes(panes={MAIN: "%1", PROJ: "%2"})
         ok, why = dtcc.entitled(CFG, {"text": "看一下进度"}, PROJ, src)
         self.assertFalse(ok)
         self.assertEqual(why, "belongs-to-7ac5(default→main)")
 
-    def test_已关闭的会话照样能被点名(self):
-        src = routes(panes={MAIN: "%1", OTHER: "%134"})   # OTHER 已关闭
-        self.assertEqual(dtcc.named_session(CFG, "9d0c 处理一下", src), OTHER)
+    def test_判据跟fleet那边是同一条(self):
+        """`dtcc.routable_sessions` 和 `fleet.routable` 必须永远同意。
+        两份判据各自演化就是两份真相 —— 这个仓库栽过的跟头正是这个。"""
+        import fleet
+        for rec in ({"pane": "%7", "known": "live"},
+                    {"pane": "%7", "known": "remembered"},
+                    {"pane": "%7", "known": "gone"},
+                    {"pane": "%7"},
+                    {"pane": "", "known": "transcript"},
+                    {}):
+            self.assertEqual(bool(dtcc.routable_sessions({"s": rec})),
+                             fleet.routable(rec), rec)
 
 
 class NoSpeakerRule(unittest.TestCase):

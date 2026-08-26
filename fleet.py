@@ -168,8 +168,37 @@ def live_panes() -> set:
     """tmux 里现在真实存在的 pane-id 集合。一次拿全，不逐个查。"""
     return _SCREEN.live_panes()
 
-def sessions(include_remembered: bool = True) -> dict:
-    """session_id -> 会话实况。
+# ---------------------------------------------------------------- 会话表
+#
+# 「pane 已经不在了」这个判断的**唯一出处**在这一段，判死只认一个依据：
+# **`tmux list-panes -a` 里有没有这个 pane-id**（下面的第 2 层）。
+#
+# **绝不能拿「status.json 里查不到这个会话」当判死依据。** 2026-07-31 12:01
+# 的事故就是反面教材：那套工具重建了状态文件，条目从 23 条掉到 2 条，
+# 于是所有路由目标一夜之间全被判成「已关闭」—— 那是误报。今天这份表有 107 个
+# 会话，真按第 1 层的缺失判，会一次性清空 100 个收件人。
+#
+# 判死的结论写进记录的 `known` 字段（`DEAD`），**下游一律读这个字段、
+# 不要自己再去问 tmux**：判断只做一次，就在这里，拿着已经一次取回的 `panes`。
+
+DEAD = "gone"          # known == DEAD 的意思是「这个 pane 已经不在 tmux 里了」
+
+
+def routable(rec: dict) -> bool:
+    """这个会话现在能不能当收件人 —— 有 pane，且那个 pane 还真在。
+
+    `pane_of()` / `named_session()` 这类**归属判据必须走它**，别自己看
+    `rec["pane"]` 有没有值。以前就是只看有没有值：2026-08-25 实测 107 个会话里
+    **45 个 `known=gone` 的死会话照样能当收件人** —— 活会话收到指令回一句
+    「不是我的，是 464f 的」，而 464f 早就关了，`entitled()` 里「主人的 pane
+    真没了才放开」那条后路永远不触发，指令**静默消失**。那 45 个里还有 `%44`
+    （2026-08-01 那次 /compact 事故的 pane）和 `7ac5`（购票会话），都是真用过的。
+    """
+    return bool(rec.get("pane")) and rec.get("known") != DEAD
+
+
+def build_sessions(raw, side, panes, at, include_remembered=True, transcript_age=None):
+    """三层合成一张会话表。**纯函数：不读盘、不问 tmux、不看时钟。**
 
     **分三层，因为单看哪一层都会判错**（2026-07-31 12:01 踩过）：
 
@@ -183,12 +212,29 @@ def sessions(include_remembered: bool = True) -> dict:
 
     所以一个会话有三种状态：**实时**（1 有）、**在但状态未知**（1 没有、2 还在）、
     **真的关了**（1 没有、2 也没有）。
+
+    **第 1 层也要过第 2 层的秤**（2026-08-25 加的）：状态文件里有记录，不代表那个
+    pane 还在。以前这一层无条件标 `known="live"`，一条陈旧记录就能让一个死会话
+    冒充收件人。现在两层都要点头才算活 —— 而这不会重演 12:01，因为**加的是
+    「第 2 层否决第 1 层」，不是「第 1 层缺失即判死」**：12:01 那种缩水在这里的
+    表现是走第 3 层被认回来，pane 还在就照样是活的。
+
+    参数：
+      raw             status.json 的内容（键是 pane）
+      side            sidecar `fleet.json` 的内容（键是 sid）
+      panes           活 pane 集合 —— 第 2 层，硬真相
+      at              「现在」，`age` 和 `last_seen.at` 都从它算 ——
+                      注进来测试才不用跟真实时钟赛跑
+      transcript_age  `sid -> 秒数 | None` 的可调用对象，第 4 层用；
+                      整个传 `None` 表示跳过第 4 层（测试里就这么用）
+
+    返回 `(out, updates)`。`updates` 是需要写回 sidecar 的条目，空 dict 表示
+    不用写盘 —— **写不写盘是调用方的事**，这个函数自己不碰任何文件。
     """
-    raw = load_json(STATUS_FILE, {})
-    side = load_json(FLEET, {})
-    panes = live_panes()
     out = {}
+    updates = {}
     seen_now = set()
+    nowt = at.timestamp()
     for pane, r in (raw.items() if isinstance(raw, dict) else []):
         sid = (r.get("session_id") or "").strip()
         if not sid:
@@ -196,6 +242,7 @@ def sessions(include_remembered: bool = True) -> dict:
         st = r.get("status") or ""
         sc = side.get(sid) or {}
         cwd = r.get("cwd") or ""
+        alive = pane in panes
         out[sid] = {
             "sid": sid,
             "pane": pane,
@@ -203,10 +250,11 @@ def sessions(include_remembered: bool = True) -> dict:
             "window_name": (r.get("window_name") or "").strip(),
             "cwd": cwd,
             # input=在等输入（闲）、running=在跑（不能打断）、done=刚干完
-            "state": {"input": "idle", "done": "idle", "running": "busy",
-                      "blocked": "blocked"}.get(st, st or "?"),
+            "state": ({"input": "idle", "done": "idle", "running": "busy",
+                       "blocked": "blocked"}.get(st, st or "?")
+                      if alive else "closed"),
             "raw_status": st,
-            "age": int(now().timestamp() - (r.get("updated_at") or 0)),
+            "age": int(nowt - (r.get("updated_at") or 0)),
             # 优先级必须跟 beat() 一致：**config 映射 > sidecar 存的旧值**。
             # 反过来会出事：会话换了 cwd（比如从项目目录切回工作区根），
             # sidecar 里还留着旧的项目短名，于是 wake 那个项目时匹配到两个候选，
@@ -214,26 +262,25 @@ def sessions(include_remembered: bool = True) -> dict:
             "project": project_of(cwd) or sc.get("project", ""),
             "note": sc.get("note", ""),
             "last_wake": sc.get("last_wake", ""),
-            "known": "live",              # 状态文件里有，实时
+            # 状态文件里有、pane 也还在 = 实时；pane 没了就跟第 3 层一个口径
+            "known": "live" if alive else DEAD,
         }
         seen_now.add(sid)
 
-    # 记住「见过」，供状态文件缩水时把会话认回来
-    dirty = False
+    # 记住「见过」，供状态文件缩水时把会话认回来。
+    # **pane 已经死掉的也照记** —— 记的是「上次见到它在哪」，那正是第 3 层的记忆，
+    # 抹掉等于把 12:01 的防线一起拆了。
     for sid in seen_now:
         r = out[sid]
-        prev = side.get(sid) or {}
+        prev = dict(side.get(sid) or {})
         if prev.get("last_seen", {}).get("pane") != r["pane"]:
             prev["last_seen"] = {"pane": r["pane"], "tmux": r["tmux"],
                                  "window_name": r["window_name"],
-                                 "cwd": r["cwd"], "at": ts(now())}
-            side[sid] = prev
-            dirty = True
-    if dirty:
-        save_json(FLEET, side)
+                                 "cwd": r["cwd"], "at": ts(at)}
+            updates[sid] = prev
 
     if not include_remembered:
-        return out
+        return out, updates
 
     # 第三层：sidecar 记的 last_seen —— 状态文件缩水时靠它把会话认回来，
     # 再用 tmux 那份真相（panes）验证那个 pane 还在不在。
@@ -259,7 +306,7 @@ def sessions(include_remembered: bool = True) -> dict:
             "raw_status": "", "age": 10 ** 6,
             "project": project_of(ls.get("cwd", "")) or sc.get("project", ""),
             "note": sc.get("note", ""), "last_wake": sc.get("last_wake", ""),
-            "known": "remembered" if alive else "gone",
+            "known": "remembered" if alive else DEAD,
             "last_seen_at": ls.get("at", ""),
         }
 
@@ -268,18 +315,14 @@ def sessions(include_remembered: bool = True) -> dict:
     # 有个会话被报成「查不到」，实际它 94 秒前还在写盘。
     # 这一层只用来判**活没活、多久没动**，不给 pane：
     # 同一个 cwd 可能开着好几个 pane，猜 pane 会把活派错地方（上面那次教训）。
-    nowt = now().timestamp()
+    if transcript_age is None:
+        return out, updates
     for sid, sc in side.items():
         if sid in out:
             continue
-        tp = transcript_of(sid)
-        if not tp:
+        age = transcript_age(sid)
+        if age is None:
             continue
-        try:
-            age = int(nowt - os.path.getmtime(tp))
-        except OSError:
-            continue
-        cwd = sc.get("cwd") or os.path.basename(os.path.dirname(tp)).replace("-", "/")
         out[sid] = {
             "sid": sid, "pane": "", "tmux": "",
             "window_name": "", "cwd": sc.get("cwd", ""),
@@ -289,7 +332,37 @@ def sessions(include_remembered: bool = True) -> dict:
             "note": sc.get("note", ""), "last_wake": sc.get("last_wake", ""),
             "known": "transcript",
         }
+    return out, updates
+
+
+def _transcript_age(sid: str, nowt: float):
+    """第 4 层的 IO：这个会话的 transcript 多久没动了。没有 transcript 返回 None。"""
+    tp = transcript_of(sid)
+    if not tp:
+        return None
+    try:
+        return int(nowt - os.path.getmtime(tp))
+    except OSError:
+        return None
+
+
+def sessions(include_remembered: bool = True) -> dict:
+    """session_id -> 会话实况。判据全在 `build_sessions()` 里，这里只剩 IO。
+
+    读三处：状态文件、sidecar、`tmux list-panes`；写一处：sidecar 的 `last_seen`。
+    """
+    raw = load_json(STATUS_FILE, {})
+    side = load_json(FLEET, {})
+    panes = live_panes()
+    at = now()
+    nowt = at.timestamp()
+    out, updates = build_sessions(raw, side, panes, at, include_remembered,
+                                  lambda sid: _transcript_age(sid, nowt))
+    if updates:
+        side.update(updates)
+        save_json(FLEET, side)
     return out
+
 
 
 def clean_name(t: str) -> str:
