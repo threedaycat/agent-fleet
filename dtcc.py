@@ -507,6 +507,21 @@ def match_broadcast(broadcasts, quoted_text: str) -> str:
     return ""
 
 
+def routable_sessions(sessions) -> dict:
+    """只留「现在真能收件」的会话。**纯函数。**
+
+    **判死这件事不在这里做。** 谁死了是 `fleet.build_sessions()` 拿
+    `tmux list-panes` 的硬真相算出来的，结论写在记录的 `known` 字段里
+    （`"gone"`）；这里只读那个结论。两处各自去问一遍 tmux 就是两份真相，
+    而且等于给一个刚被证明可测的纯判据重新加上 IO。
+
+    判据本身跟 `fleet.routable()` 是同一条，`test_entitlement.py` 里有一个
+    用例专门盯着两边别走偏。
+    """
+    return {sid: r for sid, r in (sessions or {}).items()
+            if r.get("pane") and r.get("known") != "gone"}
+
+
 def match_named_session(session_ids, text: str) -> str:
     """他在这段文字里点名了哪个会话。**纯函数。**认不出返回空。
 
@@ -741,7 +756,8 @@ def pane_of(sid: str, source=None) -> str:
     """
     if not sid:
         return ""
-    return (_routes(source).sessions().get(sid) or {}).get("pane", "") or ""
+    sess = routable_sessions(_routes(source).sessions())
+    return (sess.get(sid) or {}).get("pane", "") or ""
 
 
 def target_of(cfg, cmd: dict, source=None) -> tuple[str, str]:
@@ -787,7 +803,7 @@ def named_session(cfg, text: str, source=None) -> str:
     """
     if not text:                       # 老行为：文字为空就不去问会话表，省一次读盘
         return ""
-    return match_named_session(_routes(source).sessions(), text)
+    return match_named_session(routable_sessions(_routes(source).sessions()), text)
 
 
 def push_seen(mid: str, sig: str) -> bool:
