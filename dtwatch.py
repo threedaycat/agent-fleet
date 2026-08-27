@@ -452,6 +452,178 @@ def route_of(rec: dict, cfg, claims=None, at=None) -> tuple[str, str]:
     return "", ""
 
 
+# ---------------------------------------------------------- 「在等回信」的登记
+#
+# 判据在上面的 match_awaiting()，这一段是它的**存写侧和接线**。
+#
+# 为什么登记是一条独立命令，而不是把发消息也包进来：发私聊走的是 `dws`，
+# 在这个仓库外面。在这里再造一个发送器，就是第二个发送路径 ——
+# 而「同时管一件事的两套机制」正是这个系统最贵的那类毛病。
+# 所以仓库只提供**原语**，「发完立刻登记」这个原子性由调用方保证
+# （`dingtalk-await-reply` skill 本来就是「发完 → 挂守候」一个动作，
+# 它把 await 加进那一步就够）。
+#
+# ⚠️ 因此这一层**仍然可能被忘**。这不是设计得好，是权衡：
+# 忘了登记 → 回信落回哨兵视图（给人看，看得见）；
+# 造第二个发送器 → 两份真相，且不报错。选了前者。
+AWAITING = os.path.join(DATA, "awaiting.json")
+AWAIT_HOURS = 12          # 默认守候时长。同事隔夜回是常态，但不该活过一个工作日。
+
+
+def prune_claims(claims, at) -> list:
+    """扔掉过期和写坏的登记。**纯函数。**
+
+    写坏的定义跟 match_awaiting 一致：没 cid、没 sid、没 until 的都不算数。
+    在这里就扔掉，是为了让 awaiting.json 不会无限长 —— 它每次写都会被 prune。
+    """
+    stamp = ts(at)
+    out = []
+    for c in (claims or ()):
+        if not (c.get("cid") and c.get("sid") and c.get("until")):
+            continue
+        if c["until"] <= stamp:
+            continue
+        out.append(c)
+    return out
+
+
+def add_claim(claims, cid: str, sid: str, label: str, at, hours=AWAIT_HOURS) -> list:
+    """登记一条「我在等这个通道的回信」。**纯函数：返回新列表，不改入参。**
+
+    追加到末尾 —— match_awaiting 从后往前找，所以「后登记的赢」这条规则
+    是靠顺序实现的，不是靠去重。同一个 cid 重复登记是**合法的续期**，
+    不是错误。
+    """
+    return prune_claims(claims, at) + [{
+        "cid": cid, "sid": sid, "label": label or "",
+        "at": ts(at), "until": ts(at + dt.timedelta(hours=float(hours))),
+    }]
+
+
+def open_claims(claims, routable_sids, at) -> list:
+    """还有效、且登记方还活着的登记。**纯函数。**
+
+    `routable_sids` 是「现在还能收件的会话 id」集合，由调用方给 ——
+    判死只有 `fleet.build_sessions()` 一处算得出（`known` 字段），
+    这里再问一遍 tmux 就是第二份真相。传 `None` 表示**不做存活过滤**
+    （拿不到 fleet 时的退路：宁可投给一个可能已经没了的会话，
+    也不要因为查不到就把所有登记一起丢掉 —— 后者是静默全失效）。
+    """
+    live = prune_claims(claims, at)
+    if routable_sids is None:
+        return live
+    return [c for c in live if c["sid"] in routable_sids]
+
+
+def resolve_cid(records, name: str):
+    """从收件历史里认出「跟这个人的私聊通道」。**纯函数。**
+
+    返回 `(cid, 有几个不同的候选)`。认不出返回 `("", 0)`。
+
+    为什么从历史里认而不是去问 dws：这个仓库已经存了 14198 条记录，每条都带
+    `cid`；再去问一次接口是多一条依赖、多一个会失败的地方。代价是**从没跟你
+    私聊过的人认不出来** —— 那种情况本来也没有「回信」可等。
+
+    候选多于一个时把数字带回去，让调用方决定要不要拦 —— 重名的人各有各的
+    通道，猜错就是把回信投给等另一个人的会话。
+    """
+    if not name:
+        return "", 0
+    seen = {}
+    for r in records or ():
+        if not r.get("single"):
+            continue
+        if name not in ((r.get("sender") or ""), (r.get("conv") or "")):
+            continue
+        cid = r.get("cid") or ""
+        if cid:
+            seen[cid] = r.get("time") or ""
+    if not seen:
+        return "", 0
+    newest = max(seen.items(), key=lambda kv: kv[1])[0]
+    return newest, len(seen)
+
+
+def load_claims() -> list:
+    return load_json(AWAITING, []) or []
+
+
+def save_claims(claims) -> None:
+    save_json(AWAITING, claims)
+
+
+def live_claims(at):
+    """当下真正该参与路由的登记。IO 外壳：读盘 + 问 fleet 谁还活着。"""
+    claims = load_claims()
+    if not claims:
+        return []
+    sids = None
+    try:
+        if BASE not in sys.path:
+            sys.path.insert(0, BASE)
+        import fleet
+        sids = {sid for sid, rec in (fleet.sessions() or {}).items()
+                if fleet.routable(rec)}
+    except Exception:                                    # noqa: BLE001
+        sids = None            # 问不到就不过滤，见 open_claims 的文档
+    return open_claims(claims, sids, at)
+
+
+def cmd_await(cfg, args):
+    """登记 / 查看 / 清除「在等回信」。"""
+    at = now()
+    claims = load_claims()
+
+    if args.list:
+        live = live_claims(at)
+        if not live:
+            print("没有在等的回信。")
+            return 0
+        for c in live:
+            print(f"{c['sid'][:4]}  等到 {c['until']}  {c.get('label') or c['cid'][:12]}")
+        return 0
+
+    if args.clear:
+        keep = [c for c in prune_claims(claims, at)
+                if not (args.to and c.get("label") == args.to)
+                and not (args.cid and c.get("cid") == args.cid)]
+        if not args.to and not args.cid:
+            keep = []
+        save_claims(keep)
+        print(f"清掉 {len(prune_claims(claims, at)) - len(keep)} 条，还剩 {len(keep)} 条。")
+        return 0
+
+    sid = args.session or fleet_sid()
+    if not sid:
+        print("不知道该登记给哪个会话：给 --session，或让 CLAUDE_CODE_SESSION_ID 有值。",
+              file=sys.stderr)
+        return 2
+
+    cid, n = args.cid, 1
+    if not cid:
+        cid, n = resolve_cid(read_inbox(), args.to)
+    if not cid:
+        print(f"收件历史里找不到跟「{args.to}」的私聊通道 —— "
+              f"他从没私聊过你的话，本来也没有回信可等。\n"
+              f"确定要等就用 --cid 直接给通道 id。", file=sys.stderr)
+        return 2
+    if n > 1:
+        print(f"⚠️ 「{args.to}」匹配到 {n} 个不同通道，用了最近的那个 {cid[:12]}…；"
+              f"不对就用 --cid 指定。", file=sys.stderr)
+
+    claims = add_claim(claims, cid, sid, args.to or "", at, args.hours)
+    save_claims(claims)
+    print(f"已登记：{args.to or cid[:12]} 的回信归 {sid[:4]}，"
+          f"到 {claims[-1]['until']} 为止。")
+    return 0
+
+
+def fleet_sid() -> str:
+    """本会话 id。跟 fleet.py / dtcc.py 认的是同一个环境变量。"""
+    return (os.environ.get("CLAUDE_CODE_SESSION_ID")
+            or os.environ.get("CLAUDE_SESSION_ID") or "").strip()
+
+
 # 「必达」条目投出去之后，多久没人 mark 就重投一次。
 REDELIVER_AFTER_MINUTES = 15
 
@@ -472,7 +644,7 @@ def must_arrive(rec: dict) -> bool:
 LEVEL_ORDER = {"high": 0, "normal": 1, "low": 2}
 
 
-def select_for_session(records, cfg, session, level, triage, ledger, at):
+def select_for_session(records, cfg, session, level, triage, ledger, at, claims=None):
     """挑出「归这个会话、此刻该投给它」的条目。**纯判据：不读文件、不看时钟。**
 
     抽出来的理由跟 tmux_probe 抽屏幕抓取一样，是这条判据错了会**静默漏事**：
@@ -493,7 +665,7 @@ def select_for_session(records, cfg, session, level, triage, ledger, at):
     want = LEVEL_ORDER[level]
     out = []
     for r in records:
-        sid, label = route_of(r, cfg)
+        sid, label = route_of(r, cfg, claims, at)
         if sid != session:
             continue
         # 不把 low 塞给项目会话 —— 日报卡片、CI 推送、文件消息刷屏没意义
@@ -551,7 +723,8 @@ def cmd_for_session(cfg, args):
     at = now()
     out = []
     for r, label, prev in select_for_session(
-            read_inbox(), cfg, args.session, args.level, triage, ledger, at):
+            read_inbox(), cfg, args.session, args.level, triage, ledger, at,
+            live_claims(at)):
         if prev:
             logline(f"[for-session] 重投 {r['id'][:14]} "
                     f"（上次 {prev}，至今无 triage 记录）")
@@ -841,6 +1014,8 @@ def read_inbox(apply_self_reply=True):
 def cmd_pending(cfg, args):
     triage = load_json(TRIAGE, {})
     recs = read_inbox()
+    # 循环外取一次：live_claims 要读盘并问 fleet，放循环里就是每条记录问一遍
+    _pending_claims = live_claims(now())
     order = {"high": 0, "normal": 1, "low": 2}
     want = order[args.level]
     out = []
@@ -854,8 +1029,10 @@ def cmd_pending(cfg, args):
                 continue
         if order[r["level"]] > want:
             continue
-        # 路由过滤：默认只看「没派给别的会话」的，否则哨兵会替项目会话转述一遍
-        sid, label = route_of(r, cfg)
+        # 路由过滤：默认只看「没派给别的会话」的，否则哨兵会替项目会话转述一遍。
+        # 登记（在等回信）跟静态表在这里是同一等地位——被会话认领了就不该
+        # 再出现在给人看的视图里，否则同一条回信人和会话各处理一遍。
+        sid, label = route_of(r, cfg, _pending_claims, now())
         if not args.all_routes:
             if args.session:
                 if sid != args.session:
@@ -1324,6 +1501,16 @@ def main():
 
     p = sub.add_parser("status", help="采集器自身状态")
     p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("await", help="登记「我在等某人的回信」，回信来了归本会话")
+    p.add_argument("--to", default="", help="对方姓名，从收件历史里认通道")
+    p.add_argument("--cid", default="", help="直接给通道 id（--to 认不出时用）")
+    p.add_argument("--session", default="",
+                   help="登记给哪个会话，默认取 CLAUDE_CODE_SESSION_ID")
+    p.add_argument("--hours", type=float, default=AWAIT_HOURS, help="守候多久")
+    p.add_argument("--list", action="store_true", help="看现在在等谁")
+    p.add_argument("--clear", action="store_true", help="清除（配 --to/--cid 清一条，不配清全部）")
+    p.set_defaults(fn=cmd_await)
 
     args = ap.parse_args()
     return args.fn(cfg, args)
