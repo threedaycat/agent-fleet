@@ -27,6 +27,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(BASE, "data")
@@ -467,7 +468,13 @@ def route_of(rec: dict, cfg, claims=None, at=None) -> tuple[str, str]:
 # 忘了登记 → 回信落回哨兵视图（给人看，看得见）；
 # 造第二个发送器 → 两份真相，且不报错。选了前者。
 AWAITING = os.path.join(DATA, "awaiting.json")
-AWAIT_HOURS = 12          # 默认守候时长。同事隔夜回是常态，但不该活过一个工作日。
+AWAIT_HOURS = 12
+
+# 守候回信：多久看一次 data/inbox.ndjson。这是**读本地文件**，不打钉钉接口，
+# 所以间隔可以比采集器密 —— 真正的延迟上限由采集器的 300s 决定，不由这里。
+WATCH_INTERVAL_SECONDS = 20
+# 采集器多久没动静就判「我在盯一个没人写的文件」。跟 `feed --stale-minutes` 同一个量纲。
+COLLECTOR_STALE_MINUTES = 20          # 默认守候时长。同事隔夜回是常态，但不该活过一个工作日。
 
 
 def prune_claims(claims, at) -> list:
@@ -515,8 +522,98 @@ def open_claims(claims, routable_sids, at) -> list:
     return [c for c in live if c["sid"] in routable_sids]
 
 
-def resolve_cid(records, name: str):
-    """从收件历史里认出「跟这个人的私聊通道」。**纯函数。**
+def drop_claim(claims, cid: str, sid: str, at) -> list:
+    """撤掉「某个会话在某个通道上」的那一条登记。**纯函数。**
+
+    `cid` 和 `sid` 必须都对上才撤 —— 同一个通道上别的会话也可能在等，
+    顺手清掉就是替别人做决定，而且是静默的（他不会知道自己的登记没了）。
+    """
+    return [c for c in prune_claims(claims, at)
+            if not ((c.get("cid") or "") == cid and (c.get("sid") or "") == sid)]
+
+
+def new_replies(records, cid: str, base_ts: str, only_from: str = "") -> list:
+    """这个通道里 `base_ts` **之后**来的消息，按时间升序。**纯函数。**
+
+    不用排除「自己发的」—— 采集器在入库前就把自己的滤掉了（`cmd_poll` 里
+    `sender_id == cfg["self"]["open_dingtalk_id"]` 那一支只更新 `self_last`，
+    不写 inbox）。所以旧脚本那套「挂起时最新一条一定是我刚发的、取它的
+    senderId 当自己」的前提校验，在这里整个不需要 —— 那也是它最容易失效的
+    地方（隔太久挂就认不出自己，直接报错退出）。
+
+    `only_from` 同时按 `sender_id` 和 `sender`（姓名）匹配：群里人多时盯一个人，
+    而调用方手上通常只有姓名，没有 openDingTalkId。
+
+    时间是 `%Y-%m-%d %H:%M:%S`，字符串比较跟时间比较同序，所以直接比字符串 ——
+    跟 `read_inbox` 里 `last > r["time"]` 那处同一套。
+    """
+    if not cid or not base_ts:
+        return []
+    out = []
+    for r in records or ():
+        if (r.get("cid") or "") != cid:
+            continue
+        t = r.get("time") or ""
+        if not t or t <= base_ts:
+            continue
+        if only_from and only_from not in ((r.get("sender_id") or ""),
+                                           (r.get("sender") or "")):
+            continue
+        out.append(r)
+    out.sort(key=lambda r: ((r.get("time") or ""), (r.get("id") or "")))
+    return out
+
+
+def collector_gap_minutes(state, at):
+    """采集器上次跑完到现在多少分钟。**纯函数。** 没跑过或时间戳坏了返回 `None`。"""
+    lp = (state or {}).get("last_poll")
+    if not lp:
+        return None
+    try:
+        return (at - parse_ts(lp)).total_seconds() / 60.0
+    except (ValueError, TypeError):
+        return None
+
+
+def watch_verdict(records, cid, base_ts, only_from, state, at, deadline,
+                  stale_minutes: float = COLLECTOR_STALE_MINUTES):
+    """守候这一轮该干什么。**纯函数。** 返回 `(动作, 载荷)`。
+
+    动作四种：
+
+    - `reply`  有新消息了，载荷是记录列表
+    - `blind`  **采集器停了**，我们盯的这份文件没人在写，载荷是原因
+    - `expire` 到点了，载荷是空
+    - `""`     继续等
+
+    `blind` 必须是一个独立结果，不能并进「还没回」—— 盯一个没人写的文件，
+    看起来跟「他一直没回」一模一样。这个仓库栽过 8 次的就是这个形状：
+    用一个可能根本没在更新的面去推断另一头的状态。所以查不到采集器在跑时
+    要出声退出，而不是安静地等满 12 小时再说「他没回」。
+
+    顺序是「先看有没有回信」：文件里已经有回信了，采集器此刻是否健康就不影响
+    这个结论 —— 消息已经落盘了。
+    """
+    hits = new_replies(records, cid, base_ts, only_from)
+    if hits:
+        return "reply", hits
+    gap = collector_gap_minutes(state, at)
+    if gap is None:
+        return "blind", "采集器从没跑过（data/state.json 里没有 last_poll）"
+    if gap > stale_minutes:
+        return "blind", (f"采集器上次跑完是 {int(gap)} 分钟前，"
+                         f"超过 {stale_minutes} 分钟没动静")
+    if at >= deadline:
+        return "expire", ""
+    return "", None
+
+
+def resolve_cid(records, name: str, kind: str = "single"):
+    """从收件历史里认出「这个名字对应的通道」。**纯函数。**
+
+    `kind`：`single` 只认私聊（默认，跟以前一样）、`group` 只认群、`any` 都认。
+    群和私聊各有各的通道，混着认就可能把「等某人私聊回信」的登记落到
+    一个同名的群上。
 
     返回 `(cid, 有几个不同的候选)`。认不出返回 `("", 0)`。
 
@@ -531,7 +628,10 @@ def resolve_cid(records, name: str):
         return "", 0
     seen = {}
     for r in records or ():
-        if not r.get("single"):
+        is_single = bool(r.get("single"))
+        if kind == "single" and not is_single:
+            continue
+        if kind == "group" and is_single:
             continue
         if name not in ((r.get("sender") or ""), (r.get("conv") or "")):
             continue
@@ -616,6 +716,140 @@ def cmd_await(cfg, args):
     print(f"已登记：{args.to or cid[:12]} 的回信归 {sid[:4]}，"
           f"到 {claims[-1]['until']} 为止。")
     return 0
+
+
+def read_inbox_cid(cid: str) -> list:
+    """只读某一个通道的记录。IO 外壳。
+
+    先按子串粗筛再 `json.loads` —— inbox 现在 17MB / 15k 行，全量 `read_inbox()`
+    每轮 0.11s，粗筛 0.03s。守候要跑 12 小时、每 20 秒一轮，差的是两千多次全文解析。
+
+    不用「记住文件偏移只读新增」那个更快的写法：inbox 是只追加的，但 `reclassify`
+    重打标之后会把同一个 id 再追加一遍，按 id 去重（保留最后一条）才是对的，
+    这跟 `read_inbox` 同一套。偏移法拿不到「后面那条覆盖前面那条」这个语义。
+
+    也**不**走 `read_inbox()`：它会套 `self_last` 的降级逻辑（我之后又说过话就压级别），
+    那是给「待处理队列」用的判断，跟「他回没回我」无关。
+    """
+    if not cid or not os.path.exists(INBOX):
+        return []
+    seen = {}
+    with open(INBOX, encoding="utf-8") as f:
+        for line in f:
+            if cid not in line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (r.get("cid") or "") == cid and r.get("id"):
+                seen[r["id"]] = r
+    return list(seen.values())
+
+
+def fmt_reply(recs, label: str) -> str:
+    """把命中的回信排成给会话看的文本。"""
+    lines = [f"「{label}」有新消息（{len(recs)} 条）："]
+    for r in recs:
+        text = " ".join((r.get("text") or "").split())
+        lines.append(f"  {r.get('time','')}  {r.get('sender','')}：{text}")
+    return "\n".join(lines)
+
+
+def cmd_await_reply(cfg, args):
+    """登记 + 守候某个通道的回信。回信来了就退出，让 harness 唤起本会话。
+
+    **不自己轮询钉钉。** 盯的是 `data/inbox.ndjson` —— 采集器（launchd `.poll`，
+    300 秒一轮）已经在往里写了。旧脚本每 60 秒自己打一次
+    `dws chat message list`，那是**第二个轮询器打同一个账号的同一个 token**；
+    run.sh:40-47 记着这个形状上次的后果：多份进程同时轮询、同时写 state.json，
+    `last_poll_took_s` 涨到 600+ 秒，表现成「采集器可能停了」反复报警。
+
+    代价是延迟从「最多 1 分钟」变成「最多 5 分钟」（采集器的间隔）。等一个人回话，
+    这个换得过。**不要在这里顺手触发一次 poll 去压延迟** —— 那就是把第二个
+    写 state.json 的进程又请回来了。
+    """
+    at = now()
+
+    # ---- 认通道
+    cid, n = (args.cid or ""), 1
+    label = args.to or args.group or ""
+    if not cid:
+        if not label:
+            print("要么给 --cid，要么给 --to（私聊对象姓名）/ --group（群名）。",
+                  file=sys.stderr)
+            return 2
+        cid, n = resolve_cid(read_inbox(apply_self_reply=False), label,
+                             "single" if args.to else "group")
+        if not cid:
+            kind = "私聊过" if args.to else "在这个群里发过消息"
+            print(f"收件历史里找不到「{label}」的通道 —— 他从没{kind}的话，"
+                  f"本来也没有回信可等。\n确定要等就用 --cid 直接给通道 id。",
+                  file=sys.stderr)
+            return 2
+        if n > 1:
+            print(f"⚠️ 「{label}」匹配到 {n} 个不同通道，用了最近的那个 "
+                  f"{cid[:12]}…；不对就用 --cid 指定。", file=sys.stderr)
+    label = label or cid[:12]
+
+    # ---- 起算点默认「现在」
+    # 不取「inbox 里这个通道最新一条的时间」：采集器最多滞后 5 分钟，那条可能是
+    # 我发消息**之前**的旧消息，拿它当基线会立刻把旧消息当成回信、假命中一次。
+    # 我们刚发完消息，此刻之后来的才是回信。
+    base_ts = args.baseline or ts(at)
+
+    # ---- 登记：回信真的来了、而本进程已经不在了的时候，路由层还认得这条归谁
+    sid = args.session or fleet_sid()
+    if not sid:
+        print("⚠️ 不知道本会话 id（CLAUDE_CODE_SESSION_ID 空），**这次没有登记**："
+              "本进程还活着时守候有效，但进程一死回信就回落到默认路由。",
+              file=sys.stderr)
+    elif not args.no_register:
+        save_claims(add_claim(load_claims(), cid, sid, label, at, args.hours))
+        print(f"已登记：「{label}」的回信归 {sid[:4]}，{args.hours} 小时内有效。")
+
+    deadline = at + dt.timedelta(hours=float(args.hours))
+    print(f"守候「{label}」{cid[:12]}… 起算 {base_ts}，"
+          f"到 {ts(deadline)} 为止，每 {args.interval}s 看一次 inbox。", flush=True)
+
+    def finish(msg: str, code: int) -> int:
+        # 登记连同守候一起收尾：留着一条已经没人守的登记，会把后来的消息静默路由
+        # 给一个不再等它的会话。宁可回落到默认路由（看得见），不要留个哑登记。
+        if sid and not args.no_register:
+            save_claims(drop_claim(load_claims(), cid, sid, now()))
+        if args.out:
+            try:
+                with open(args.out, "w", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+            except OSError as e:                              # noqa: BLE001
+                print(f"（写 --out 失败：{e}）", file=sys.stderr)
+        print(msg, flush=True)
+        return code
+
+    while True:
+        action, payload = watch_verdict(
+            read_inbox_cid(cid), cid, base_ts, args.from_who,
+            load_json(STATE, {}), now(), deadline, args.stale_minutes)
+        if action == "reply":
+            body = fmt_reply(payload, label)
+            # inbox 不存引用块，所以补几条上文当锚 —— 同一个窗口里常有好几件事在跑。
+            prev = sorted((r for r in read_inbox_cid(cid)
+                           if (r.get("time") or "") <= base_ts),
+                          key=lambda r: r.get("time") or "")[-3:]
+            if prev:
+                body += "\n\n  ── 这个通道之前的几条（上文锚，inbox 不存引用块）──"
+                for r in prev:
+                    text = " ".join((r.get("text") or "").split())[:120]
+                    body += f"\n  {r.get('time','')}  {r.get('sender','')}：{text}"
+            return finish(body, 0)
+        if action == "blind":
+            return finish(f"[!] 守候「{label}」没法作数：{payload}。\n"
+                          f"    盯的是 data/inbox.ndjson，没人往里写的时候，"
+                          f"「他没回」和「我看不见」长得一模一样。\n"
+                          f"    先 ./run.sh status 看采集器。", 1)
+        if action == "expire":
+            return finish(f"守候 {args.hours} 小时到期，「{label}」一直没有新消息。", 0)
+        time.sleep(float(args.interval))
 
 
 def fleet_sid() -> str:
@@ -1511,6 +1745,27 @@ def main():
     p.add_argument("--list", action="store_true", help="看现在在等谁")
     p.add_argument("--clear", action="store_true", help="清除（配 --to/--cid 清一条，不配清全部）")
     p.set_defaults(fn=cmd_await)
+
+    p = sub.add_parser("await-reply",
+                       help="登记 + 守候回信：盯 inbox，不自己轮询钉钉")
+    p.add_argument("--to", default="", help="私聊对象姓名")
+    p.add_argument("--group", default="", help="群名")
+    p.add_argument("--cid", default="", help="直接给通道 id（--to/--group 认不出时用）")
+    p.add_argument("--from", dest="from_who", default="",
+                   help="只认这个人发的（姓名或 sender_id）。群里人多时盯一个人")
+    p.add_argument("--session", default="",
+                   help="登记给哪个会话，默认取 CLAUDE_CODE_SESSION_ID")
+    p.add_argument("--hours", type=float, default=AWAIT_HOURS, help="守候多久")
+    p.add_argument("--baseline", default="",
+                   help="起算时间 'YYYY-MM-DD HH:MM:SS'，默认「现在」")
+    p.add_argument("--interval", type=float, default=WATCH_INTERVAL_SECONDS,
+                   help="多久看一次 inbox（读本地文件，不打接口）")
+    p.add_argument("--stale-minutes", type=float, default=COLLECTOR_STALE_MINUTES,
+                   help="采集器多久没动静就判「我在盯一个没人写的文件」并出声退出")
+    p.add_argument("--no-register", action="store_true",
+                   help="只守候不登记（本进程死了回信就回落默认路由）")
+    p.add_argument("--out", default="", help="结果也写到这个文件")
+    p.set_defaults(fn=cmd_await_reply)
 
     args = ap.parse_args()
     return args.fn(cfg, args)
