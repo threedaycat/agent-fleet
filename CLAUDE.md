@@ -41,6 +41,21 @@
 - **不要动 launchd**（`./run.sh install/uninstall`）—— 三个采集进程正在跑，停了就开始漏消息。
 - **不碰 `_local-*`**：本机私有，含真实人名和坐标。
 - `git commit` / `git push` **一律用户说了才做**。
+- **公开仓库。** 任何 tracked 文件（**包括测试 fixture 和 example 配置**）里不许出现
+  真通道 id、真 sender_id、真人名、真群名、公司邮箱。2026-08-27 因为「注释里抄一个真
+  cid 说明形状」泄漏过一次，只能靠删库重建关掉 —— **force-push 关不掉**，
+  GitHub 不 GC，实测 36/40 个旧 commit 仍可按全 40 位 SHA fetch。
+  造 fixture 前先量真数据的形状，别抄真值。
+
+## MCP 面（agent 怎么读这个系统）
+
+`fleet_mcp.py` 是编队状态的**只读** MCP 面，三个工具：`fleet_status` / `my_queue` /
+`awaiting`。接法、输出契约、以及**为什么写操作不做成工具**见 `FLEET-MCP.md`。
+
+一句话边界：**投递 / send-keys / 发消息不做成工具**，走 desk 审批。
+`--allowedTools` 实测不是边界（agent 用 `ToolSearch` 绕到 `Monitor`，
+那个工具入参里有 `command`），边界拦不住的东西就不能做成工具。
+`tests/test_fleet_mcp.py::test_一期不许有写工具` 是这个决定的闸。
 
 ## 判据和 IO 分开
 
