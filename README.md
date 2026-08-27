@@ -175,7 +175,7 @@ python3 fleet.py beat --note "刚干完什么"    # 手工报一次心跳（平�
 ```
 
 **项目短名配在 `config.json` 的 `fleet.projects`**（cwd 前缀 → 短名，最长前缀优先）。
-不配的话会退回目录名 —— 那就会出现「这套东西叫 dtwatch，署名却写着 dingtalk-watch」
+不配的话会退回目录名 —— 那就会出现「这套东西叫 dtwatch，署名却写着 agent-fleet」
 这种膈应事。新开一个项目会话，在这张表里加一行就有名字了。
 
 **会话状态的真相是 `~/.claude/tmux-claude-status.json`**（见下面「外部依赖」一节）。

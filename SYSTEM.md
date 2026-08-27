@@ -29,7 +29,7 @@ Claude 只在最末端出现——活被派到某个项目会话手里，那个 
 ```
 claude-tmux-sessions   通用、与消息来源无关     ← 「有哪些会话、什么状态、跳过去」的唯一真相
         ↑ 读                                    prefix+g 打开 fzf picker
-dingtalk-watch （本仓库）  钉钉适配那半          ← 加「消息怎么路由、队列、唤醒、事件」
+agent-fleet （本仓库）  钉钉适配那半          ← 加「消息怎么路由、队列、唤醒、事件」
 ```
 
 - **claude-tmux-sessions**（外部依赖，不在本仓库）：每个 Claude pane 的状态
@@ -37,7 +37,7 @@ dingtalk-watch （本仓库）  钉钉适配那半          ← 加「消息怎�
   status / session_id）。它是「会话存活/状态」的真相，本仓库**只读它**、不再自己维护一套。
   没有它会怎样、缺哪些功能，见 [README.md](README.md) 的「外部依赖」一节。
   > TODO：补上 claude-tmux-sessions 的仓库地址和安装说明。
-- **dingtalk-watch**（本仓库）：只加钉钉那半。**红线：具体消息内容、联系人、群名一律
+- **agent-fleet**（本仓库）：只加钉钉那半。**红线：具体消息内容、联系人、群名一律
   不写进 claude-tmux-sessions**——那个是通用的，要保持跟任何一家公司无关。
 
 ---
@@ -134,7 +134,7 @@ python3 dtcc.py say "..."                     # 主动往手机播报一条（�
 ## 7. 在新机器上跑起来
 
 ```bash
-git clone <本仓库> && cd dingtalk-watch
+git clone <本仓库> && cd agent-fleet
 ./fleet_up.py setup        # 九步流水线
 ```
 
