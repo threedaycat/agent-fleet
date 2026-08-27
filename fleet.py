@@ -856,7 +856,7 @@ def rule(title: str, width: int) -> str:
 def project_of(cwd: str) -> str:
     """这个目录属于哪个项目，用**项目自己的短名**，不是目录名。
 
-    目录名是 `dingtalk-watch`，但这套东西叫 `dtwatch`；别的项目同理 ——
+    目录名是 `agent-fleet`，但这套东西叫 `dtwatch`；别的项目同理 ——
     目录叫 `xxx-service`，日常说的是「项目A」。手机上看署名要的是后者。
     所以映射写在 config.json 的 `fleet.projects` 里（cwd 前缀 → 短名），
     集中一处配，不用往每个项目仓库里塞标识文件。配不到才退回目录名。

@@ -44,18 +44,18 @@ sessions:
       - name: watch
         layout: main-vertical
         panes:
-          - cwd: ~/dingtalk-watch
+          - cwd: ~/Zymix/agent-fleet
             role: watch
-          - cwd: ~/dingtalk-watch
+          - cwd: ~/Zymix/agent-fleet
             cmd: ./run.sh tail
 
       # 巡检：按 TRIAGE.md 定期过一遍待处理队列。
       - name: duty
         layout: even-horizontal
         panes:
-          - cwd: ~/dingtalk-watch
+          - cwd: ~/Zymix/agent-fleet
             role: duty
-          - cwd: ~/dingtalk-watch
+          - cwd: ~/Zymix/agent-fleet
 
       # 健康检查：只读地盯着这套系统本身有没有跑歪。
       - name: doctor
@@ -69,6 +69,6 @@ sessions:
       - name: remote
         layout: even-horizontal
         panes:
-          - cwd: ~/dingtalk-watch
+          - cwd: ~/Zymix/agent-fleet
             role: remote
-          - cwd: ~/dingtalk-watch
+          - cwd: ~/Zymix/agent-fleet

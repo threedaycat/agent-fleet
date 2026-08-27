@@ -127,7 +127,7 @@
  "fleet": {
   "projects": {
    "~/work/项目A目录": "项目A（署名和 fleet list 用这个短名，不是目录名）",
-   "~/work/dingtalk-watch": "dtwatch"
+   "~/Zymix/agent-fleet": "dtwatch"
   }
  }
 }

@@ -160,7 +160,7 @@ diff /tmp/before.txt /tmp/after.txt      # 必须完全一致
 
 ---
 
-## 五、`dingtalk-watch` 侧改动清单
+## 五、`agent-fleet` 侧改动清单
 
 新增一个文件 `picker_items.py`（本仓库内，钉钉相关的东西都关在这边）：
 
@@ -215,7 +215,7 @@ entry = {"pane", "session", "window", "window_name", "pane_index",
    其余字段要么是显示、要么缺了就直接看不见（会立刻发现）。落地时在
    `picker_items.py` 里对这两个各加一句防御：`status` 不在已知词表就当 `unknown`
    且不据此判卡住；`updated_at` 大于 1e12 就按毫秒处理。
-2. 判卡住的阈值不硬编码在 picker 侧，放 `dingtalk-watch/config.json`，
+2. 判卡住的阈值不硬编码在 picker 侧，放 `agent-fleet/config.json`，
    写入端语义真变了我这边一行配置就能对齐。
 
 ## 七、取舍与已知影响（要点头的地方）
@@ -263,7 +263,7 @@ export CLAUDE_TMUX_EXTRA_CMD=<本仓库绝对路径>/picker_items.py
 
 ## 十、落地顺序
 
-1. 先做 `dingtalk-watch/picker_items.py`，用 `$CMD list` 在命令行验证输出格式。
+1. 先做 `agent-fleet/picker_items.py`，用 `$CMD list` 在命令行验证输出格式。
    这一步不碰那个仓库。
 2. 改 picker 侧那 4 个脚本 + `DESIGN.md`/`README*.md`。
    **不碰 `hooks/tmux_status_update.py`。**
