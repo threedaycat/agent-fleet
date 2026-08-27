@@ -21,12 +21,20 @@ import dtwatch as dw
 
 SID_A = "aaaa1111-0000-0000-0000-000000000000"
 SID_B = "bbbb2222-0000-0000-0000-000000000000"
-# 用真实形状的 cid。实测长这样：cidZZfake0000000AAAAAAAAA=
+# 通道 id 照真实形状伪造 —— **不许把真 cid 写进来**，这个仓库是公开的。
 # —— **全都以 "cid" 开头、都是长 base64**。一开始我写的是 "cid张==" / "cid李=="，
 # 前 4 个字符就分岔了，于是「把精确比较写成前缀/子串匹配」这个坑（`match_broadcast`
 # 正栽在它的 40 字符前缀上）在测试里根本露不出来 —— 变异测试抓到的。
-CID_张 = "cidAaBbCcDdEeFf0011/2233445566778899AaBbCc="
-CID_李 = "cidAaBbCcDdEeFf0011/2233445566778899DdEeFf="
+# 通道 id 直接照抄真实形状（2026-08-27 量的 data/ 里 67 个通道）：
+#   - **长度有 27 和 47 两种**，不是一种 —— 定长 fixture 会让「按长度截断/校验」
+#     这类 bug 活下来；
+#   - 任意两个通道的最长公共前缀只有 5 个字符（`cidyI` 这种），
+#     且**没有一个通道 id 是另一个的子串**。
+# 所以「精确匹配 vs 子串匹配」光靠两个 id 是测不出来的（两边行为一样），
+# 真正要钉的是**截断的 id 不许匹配** —— 输出里到处印 `cid[:12]…`，
+# 迟早有人把印出来的那截当 --cid 传回来。见 test_截断的cid不许匹配。
+CID_张 = "cidZZfake0000000AAAAAAAAA=="
+CID_李 = "cidZZfake1111111BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
 
 NOW = dt.datetime(2026, 8, 25, 16, 0, 0)
 
@@ -142,14 +150,24 @@ class 认不回来的时候(unittest.TestCase):
             with self.subTest(记录=bad):
                 self.assertEqual(dw.match_awaiting([claim()], bad, NOW), ("", ""))
 
-    def test_两个只差尾巴的_cid_不许串台(self):
-        """真实 cid 共享 "cid" 前缀、只在中后段分岔。把精确比较写成前缀或
-           子串匹配，这两个就会互相命中 —— 投给错的会话，且不报错。
-           `match_broadcast` 就栽在它那个 40 字符前缀上（notes 里记着）。"""
-        self.assertEqual(CID_张[:35], CID_李[:35])       # 前 35 个字符一模一样
+    def test_截断的cid不许串台(self):
+        """把精确比较写成前缀或子串匹配，会把别人的通道当成我等的那个 ——
+           投给错的会话，且不报错。`match_broadcast` 就栽在它那个 40 字符
+           前缀上（notes 里记着）。
+
+           **写这条测试时先搞错过一次**：原版断言「两个真 cid 前 35 字符一样」，
+           那是编的。2026-08-27 量了 data/ 里 67 个通道：任意两个的最长公共前缀
+           只有 5 个字符，且没有一个是另一个的子串 —— 所以拿两个完整 id 根本
+           分不出精确匹配和子串匹配（两种实现都对）。真正能分开的是**截断的
+           id 不许命中**：输出里到处印 `cid[:12]…`，迟早有人把它当 id 传回来。"""
         claims = [claim(sid=SID_A, cid=CID_张)]
         self.assertEqual(dw.match_awaiting(claims, rec(cid=CID_张), NOW)[0], SID_A)
         self.assertEqual(dw.match_awaiting(claims, rec(cid=CID_李), NOW), ("", ""))
+        for 截 in (CID_张[:12], CID_张[:5], "cid", CID_张 + "X"):
+            with self.subTest(截断=截):
+                self.assertEqual(
+                    dw.match_awaiting([claim(sid=SID_A, cid=截)],
+                                      rec(cid=CID_张), NOW), ("", ""))
 
     def test_登记侧要是把人名写进_cid_也不许命中(self):
         """**这条是给还没写的登记侧提前立的约束。**

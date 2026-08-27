@@ -21,8 +21,16 @@ import dtwatch as dw
 
 SID_A = "aaaa1111-0000-0000-0000-000000000000"
 SID_B = "bbbb2222-0000-0000-0000-000000000000"
-CID_张 = "cidAaBbCcDdEeFf0011/2233445566778899AaBbCc="
-CID_李 = "cidAaBbCcDdEeFf0011/2233445566778899DdEeFf="
+# 通道 id 直接照抄真实形状（2026-08-27 量的 data/ 里 67 个通道）：
+#   - **长度有 27 和 47 两种**，不是一种 —— 定长 fixture 会让「按长度截断/校验」
+#     这类 bug 活下来；
+#   - 任意两个通道的最长公共前缀只有 5 个字符（`cidyI` 这种），
+#     且**没有一个通道 id 是另一个的子串**。
+# 所以「精确匹配 vs 子串匹配」光靠两个 id 是测不出来的（两边行为一样），
+# 真正要钉的是**截断的 id 不许匹配** —— 输出里到处印 `cid[:12]…`，
+# 迟早有人把印出来的那截当 --cid 传回来。见 test_截断的cid不许匹配。
+CID_张 = "cidZZfake0000000AAAAAAAAA=="
+CID_李 = "cidZZfake1111111BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
 NOW = dt.datetime(2026, 8, 27, 10, 0, 0)
 
 
