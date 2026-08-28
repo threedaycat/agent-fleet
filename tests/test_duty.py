@@ -62,21 +62,62 @@ class Project(unittest.TestCase):
 
 class PickBatch(unittest.TestCase):
     def items(self, n=5):
-        return [duty.project(rec(f"m{i}", f"2026-08-{10 + i:02d} 10:00:00"))
+        """时间必须是**真的递增时间戳**。
+
+        第一版写的是 `f"2026-08-{10+i:02d}"`，n=400 时会造出 `2026-08-410`
+        这种非法日期，而排序是按字符串比的 —— 顺序全乱，测试红了半天，
+        坏的是 fixture 不是实现。**fixture 比生产干净或比生产脏，都会让测试
+        因为错误的理由通过或失败。**
+        """
+        base = dt.datetime(2026, 6, 1, 10, 0, 0)
+        return [duty.project(rec(f"m{i}",
+                                 (base + dt.timedelta(hours=i)).strftime("%Y-%m-%d %H:%M:%S")))
                 for i in range(n)]
 
     def test_滤掉报过的(self):
         b = duty.pick_batch(self.items(3), {"m1"}, cap=9)
         self.assertEqual([x["id"] for x in b], ["m0", "m2"])
 
-    def test_从旧到新(self):
-        """积压 319 条时，按新到旧排会让最旧的永远轮不到 ——
-        而「已经错过时效」本身就是要上报的事。"""
+    def test_装得下就全给(self):
         b = duty.pick_batch(self.items(4), set(), cap=9)
         self.assertEqual([x["id"] for x in b], ["m0", "m1", "m2", "m3"])
 
+    def test_装不下时两头都取(self):
+        """两个单向排序各有一个失效模式，实测都会发生：
+
+        - 只从旧到新：积压 320 条、一轮 12 条、每小时一轮 → 刚到的紧急消息
+          排在第 321 位，**要等 27 小时才被看到**；
+        - 只从新到旧：最旧的永远轮不到，而「已经错过时效」正是最该上报的事。
+        """
+        items = self.items(50)
+        b = duty.pick_batch(items, set(), cap=12, fresh_slots=4)
+        ids = [x["id"] for x in b]
+        self.assertEqual(len(ids), 12)
+        self.assertIn("m0", ids)      # 最旧的在
+        self.assertIn("m49", ids)     # 最新的也在
+        self.assertEqual(ids[:8], [f"m{i}" for i in range(8)])
+        self.assertEqual(ids[8:], [f"m{i}" for i in range(46, 50)])
+
+    def test_返回按时间升序(self):
+        b = duty.pick_batch(self.items(50), set(), cap=12, fresh_slots=4)
+        self.assertEqual([x["time"] for x in b], sorted(x["time"] for x in b))
+
+    def test_留给新条目的名额不能吃掉全部(self):
+        b = duty.pick_batch(self.items(50), set(), cap=3, fresh_slots=9)
+        self.assertEqual(len(b), 3)
+
+    def test_不留名额就是纯从旧到新(self):
+        b = duty.pick_batch(self.items(50), set(), cap=5, fresh_slots=0)
+        self.assertEqual([x["id"] for x in b], [f"m{i}" for i in range(5)])
+
     def test_截到上限(self):
         self.assertEqual(len(duty.pick_batch(self.items(30), set(), cap=12)), 12)
+
+    def test_新条目最多等一轮(self):
+        """这条是上面那个 27 小时的直接回归测试：队列再长，最新的也在这一批里。"""
+        items = self.items(400)
+        b = duty.pick_batch(items, set(), cap=12)
+        self.assertIn(items[-1]["id"], [x["id"] for x in b])
 
     def test_全报过就空(self):
         self.assertEqual(duty.pick_batch(self.items(2), {"m0", "m1"}, cap=9), [])
