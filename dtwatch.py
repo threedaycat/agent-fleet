@@ -1858,24 +1858,63 @@ def cmd_remind(cfg, args):
 AT_ME_REMIND_AFTER_MINUTES = 15
 
 
+def at_me_handled(rec: dict, in_triage: bool) -> bool:
+    """这条点名到他的消息，算不算已经有人管了。**纯函数。**
+
+    三种算「已处理」：
+
+    1. **triage 里有记录** —— 人或会话明确标过。
+    2. **他自己贴了表情**（采集时打的 `acked:<表情>`）。这是本仓库一贯口径：
+       `sweep_acks` 见到表情直接写 triage=done，但它只扫 level>low 的会话，
+       而贴过表情的条目采集时就被压成 low 了 —— 所以这类只有 flag、没有 triage
+       记录，必须在这儿单独认。不认的话第一条自动提醒就会去催他已经 OK 过的事。
+    3. **私聊里、他之后在同一通道说过话**（`replied_after` + `single`）。
+
+    ## 第 3 条为什么只限私聊
+
+    `read_inbox` 会给「我之后又在同一通道说过话」的条目打 `replied_after`，
+    但**故意不给 at_me 降级** —— 那是 2026-07-30 的教训：某同事在项目群
+    @ 他本人定基线，他之后又在同群说过别的话，级别被降 → `pending --level high`
+    里看不见 → 挂了 25 小时。**群里几十条刷过去，「说过话」根本不等于
+    「看见了那个 @」。**
+
+    但那条规矩是**群**推出来的，套到私聊上就错了：一对一窗口里，
+    你在他那条之后说了话，基本就是在回他。
+
+    2026-08-28 实测这个错的代价：哨兵认为「还没处理」的有 331 条，
+    其中 **224 条他之后在同一通道说过话**。当天更直接的一次——
+    13:14 对方问「仓库有了吗」，13:29:57 他回了（`self_last` 记着），
+    13:30:19 哨兵**仍然**推「有人点你的名还没处理：13:14 仓库有了吗」，
+    回完 22 秒。他的原话：「我已经回复了吧，你消息太慢了」。
+
+    代价不对称，所以敢在私聊上放开：
+      - 放开后误判成「已处理」→ 他没回全的话，对方会再问一次（当天就发生了，
+        对方 13:21 又说「好的」、13:37 又说了一句）。**代价可见且会自愈。**
+      - 不放开 → 每天几百条假警报，通道整体不可信。**代价是那个通道废掉。**
+    """
+    if in_triage:
+        return True
+    flags = rec.get("flags") or []
+    if any(f.startswith("acked:") for f in flags):
+        return True
+    if rec.get("single") and "replied_after" in flags:
+        return True
+    return False
+
+
 def stale_at_me(cfg, minutes: int = AT_ME_REMIND_AFTER_MINUTES) -> list[dict]:
     """点名到他、超过 minutes 分钟、又没有任何「已处理」痕迹的。
 
-    「已处理」有两种，都要认：
-      - triage 里有记录（人或会话标过）
-      - 他自己贴了表情（采集时打的 `acked:<表情>` 标记）。这是这个仓库一贯的口径：
-        `sweep_acks` 见到表情直接写 triage=done。但它只扫 level>low 的会话，
-        而贴过表情的条目在采集时就被压成 low 了 —— 所以这类只有 flag、没有 triage
-        记录，必须在这儿单独认。不认的话，第一条自动提醒就会去催他已经 OK 过的事，
-        那这个通道立刻就不可信了。
+    「算不算已处理」这条判据在 `at_me_handled` 里（纯函数，三种都要认，
+    连同为什么私聊和群不一样，都写在那儿）。这里只剩 IO：读台账、比时间。
     """
     triage = load_json(TRIAGE, {})
     cutoff = now() - dt.timedelta(minutes=minutes)
     out = []
     for r in read_inbox():
-        if "at_me" not in r["flags"] or r["id"] in triage:
+        if "at_me" not in r["flags"]:
             continue
-        if any(f.startswith("acked:") for f in r["flags"]):
+        if at_me_handled(r, r["id"] in triage):
             continue
         try:
             if parse_ts(r["time"]) > cutoff:
