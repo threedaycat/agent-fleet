@@ -1178,7 +1178,7 @@ def append_outbox(rows) -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
-def push_outbox(cfg, at) -> dict:
+def push_outbox(cfg, at, force: bool = False) -> dict:
     """把还没给他看过的草稿推到手机。IO 外壳。
 
     走 `send_reminder` 那条**唯一**的提醒通道 —— 免打扰时段和最小间隔对它同样
@@ -1194,7 +1194,9 @@ def push_outbox(cfg, at) -> dict:
                 "pending": len(pending_entries(entries))}
     # 两种都数：`fresh` 里两种都有，只数草稿的话「共 N 条未处理」会小于新增条数。
     body = format_push(fresh, len(pending_entries(entries)))
-    res = send_reminder(cfg, body)
+    # `force` 只在**他本人明确说「发」**的时候用：绕过最小间隔和免打扰时段。
+    # 默认永远 False —— 自动化不许自己决定绕过这两条约束。
+    res = send_reminder(cfg, body, force=force)
     if res.get("ok"):
         append_outbox(mark_notified([e["id"] for e in fresh], at))
         logline("[outbox] 推了 %d 条待拍板" % len(fresh))
@@ -1253,7 +1255,7 @@ def cmd_outbox(cfg, args):
         return 0
 
     if args.action == "notify":
-        res = push_outbox(cfg, at)
+        res = push_outbox(cfg, at, force=args.force)
         print(json.dumps({k: v for k, v in res.items() if k != "body"},
                          ensure_ascii=False))
         return 0 if res.get("ok") else 1
@@ -1852,8 +1854,12 @@ def send_reminder(cfg, text: str, force: bool = False,
                 return {"ok": False, "skipped": "min_interval", "last": last}
         except ValueError:
             pass
+    # `--ai-tag=false` 不能省：dws 默认 true，会给消息打「通过AI发送」角标。
+    # 那个角标会被引用、被截图、被带进汇报。用户的长期口径就是不要它。
+    # （2026-08-28 才发现全仓一处都没加过 —— 在这之前每条都带着角标发出去了。）
     _, err = dws(["chat", "message", "send",
                   "--open-dingtalk-id", cfg["self"]["open_dingtalk_id"],
+                  "--ai-tag=false",
                   "--text", text])
     if err:
         return {"ok": False, "error": err}
@@ -2277,6 +2283,8 @@ def main():
     p.add_argument("--session", default="", help="谁拟的，默认取本会话")
     p.add_argument("--id", default="", help="show / drop 用")
     p.add_argument("--why", default="", help="drop 的理由")
+    p.add_argument("--force", action="store_true",
+                   help="notify 时绕过最小间隔和免打扰。**只在他本人说「发」时用**")
     p.add_argument("--no-notify", action="store_true",
                    help="只落盘不推（他就看不到，一般别用）")
     p.set_defaults(fn=cmd_outbox)

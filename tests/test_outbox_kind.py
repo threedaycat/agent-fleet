@@ -267,3 +267,50 @@ class NotifyWiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AiTag(unittest.TestCase):
+    """发消息一律不带「通过AI发送」角标。
+
+    用户的长期口径：`dws` 默认 `--ai-tag=true`，那个角标会被引用、被截图、
+    被带进汇报。2026-08-28 才发现全仓**一处都没加过** —— 在这之前每条提醒
+    都带着角标发出去了。
+
+    断言看代码不看源文本（`ast.unparse` 去注释）—— 今天第四次栽在这上面，
+    而这条尤其危险：注释里写着 `--ai-tag=false` 也能让断言假过。
+    """
+
+    def _code(self, fn):
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(fn).lstrip())
+        b = tree.body[0]
+        if (b.body and isinstance(b.body[0], ast.Expr)
+                and isinstance(b.body[0].value, ast.Constant)
+                and isinstance(b.body[0].value.value, str)):
+            b.body.pop(0)
+        return ast.unparse(tree)
+
+    def test_两条发送路径都带上了(self):
+        import dtcc
+        for fn in (dtwatch.send_reminder, dtcc.send):
+            src = self._code(fn)
+            self.assertIn("message", src)
+            self.assertIn("--ai-tag=false", src,
+                          f"{fn.__name__} 少了 --ai-tag=false")
+
+    def test_全仓没有别的发送路径(self):
+        """新增一处发送而忘了加角标参数，这条会红。"""
+        import os
+        import re
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        hits = []
+        for name in os.listdir(base):
+            if not name.endswith(".py"):
+                continue
+            src = open(os.path.join(base, name), encoding="utf-8").read()
+            for m in re.finditer(r'"chat",\s*"message",\s*"send"', src):
+                tail = src[m.start():m.start() + 400]
+                if "--ai-tag=false" not in tail:
+                    hits.append(f"{name}:{src[:m.start()].count(chr(10)) + 1}")
+        self.assertEqual(hits, [], f"这些发送点没加 --ai-tag=false：{hits}")
