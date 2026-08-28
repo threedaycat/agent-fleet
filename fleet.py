@@ -1002,9 +1002,27 @@ def resolve_target(key: str) -> tuple[str, dict]:
 def cmd_wake(args):
     """把任务打进目标会话的 tmux pane，叫它接着干。
 
-    为什么是 send-keys：Claude Code 没有对外的「注入一条消息」接口，
-    而这些常驻会话的价值恰恰在它攒下的上下文里，用 `claude -p` 另起一个
-    进程就丢了那些上下文。
+    为什么是 send-keys：Claude Code 没有对外的「往**正在跑的**会话注入一条消息」
+    的接口。
+
+    ⚠️ **原来这里写的是「用 `claude -p` 另起一个进程就丢了那些上下文」，那句是错的**
+    （2026-08-28 用户指出并实测推翻）：`claude -p --resume <sid>` 会带上上下文 ——
+    拿一个已关闭的会话试过，cache_read 16598 tokens，它答出了只有那次历史里
+    才有的事。
+
+    真正的约束是**分叉**，不是丢失：
+      - 加 `--fork-session` 会拿到一个**新的 session id**（实测 a716445f… →
+        a56d2ddd…）。那一支攒下的东西**回不到原来那个 pane**，
+        而 pane 里那个进程还在按自己的 id 往下写。下一次 send-keys 打过去，
+        它对分叉出去的那些事一无所知。
+      - 不加 `--fork-session` 就是**两个进程写同一份 transcript**，
+        而 pane 里那个还活着。（没敢在活会话上实测，理由见上一行。）
+      - 代价也不对称：resume 一个 129 KB 的小 transcript 实测要 10.8 秒；
+        本机活着的 84 个会话 transcript 平均 10.8 MB、最大 161 MB。
+        send-keys 是即时的，那个进程本来就把上下文驻留在内存里。
+
+    所以结论没变（还是 send-keys），但理由要说对：**是够不着正在跑的那个进程，
+    不是 claude -p 没有记忆。**
 
     两个踩过的坑，都在下面的代码里防住了：
       1. **必须用 pane-id（%NN）当 target**，不能用 `session:window` ——
