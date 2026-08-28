@@ -81,6 +81,88 @@ def claude_status() -> dict[str, dict]:
         return {}
 
 
+ROLE_STALE_HOURS = 24
+
+
+def role_state(role: str, pane: dict | None, at: float,
+               stale_hours: float = ROLE_STALE_HOURS) -> dict:
+    """一个声明出来的角色，现在到底是什么状况。**纯函数**，只吃数据。
+
+    五种状态**必须分得开**，这就是写它的全部理由：
+
+    | 状态 | 意思 | 为什么不能跟别的混 |
+    |---|---|---|
+    | `missing` | 声明了，pane 不存在 | 心跳看不见它，因为它压根没上报过 |
+    | `never`   | pane 在，上下文 **0k** | 从来没有过一句对话 —— 起来了 ≠ 干过活 |
+    | `stale`   | 干过活，但心跳太旧 | 曾经能用，现在不动了 |
+    | `live`    | 干过活且心跳新 | 只有这个算正常 |
+    | `unknown` | 上下文**读不出** | ⚠️ 绝不能报成 `never` |
+
+    最后一行是这个函数最容易写错的地方。`fleet.ctx_usage` 解析不到返回 `None`，
+    把它当 0 处理就会得出「从没干过活」——那是**编造**，不是观察。
+    2026-08-28 量出 doctor/duty/watch 三个角色 0k 时，心跳全报 `input`（健康），
+    就是因为原来的判据只问「pane 在不在」。
+    """
+    if pane is None:
+        return {"role": role, "coord": None, "pane": None,
+                "state": "missing", "note": "声明了但 pane 不存在"}
+
+    out = {"role": role, "coord": pane.get("coord"), "pane": pane.get("pane")}
+    kb = _ctx_kb(pane.get("ctx"))
+    if kb is None:
+        out.update(state="unknown", note="上下文读不出，无法判断干过活没有")
+        return out
+
+    idle = _seen_age(pane.get("seen"), at)
+    if kb == 0:
+        out.update(state="never", note="上下文 0k —— 从来没有过一句对话")
+        return out
+    if idle is None:
+        out.update(state="unknown", note=f"{kb}k，但心跳时间读不出")
+        return out
+    if idle > stale_hours * 3600:
+        out.update(state="stale", note=f"{kb}k，最后心跳 {idle / 3600:.1f} 小时前")
+        return out
+    out.update(state="live", note=f"{kb}k，最后心跳 {idle / 3600:.1f} 小时前")
+    return out
+
+
+def _ctx_kb(ctx):
+    """`"210k (21%)"` → `210`；读不出给 `None`，**不给 0**。
+    跟 `fleet._ctx_kb` 同一套正则，有用例对账（test_role_state）。"""
+    if fleet is not None:
+        return fleet._ctx_kb(ctx)
+    import re
+    if not ctx:
+        return None
+    m = re.match(r"(\d+)k", ctx)
+    return int(m.group(1)) if m else None
+
+
+def _seen_age(seen, at: float):
+    """心跳时间戳 → 距今多少秒。台账里它是 epoch 浮点，但也可能缺、可能是字符串。
+    读不出返回 `None` —— 不要拿 `0` 冒充「刚刚」，那会把死掉的角色报成健康。"""
+    try:
+        return max(0.0, at - float(seen))
+    except (TypeError, ValueError):
+        return None
+
+
+def role_report(panes: list[dict], decl: dict, at: float) -> list[dict]:
+    """把声明和现实并起来。**纯函数**，panes/decl 都由调用方采好。
+
+    `decl` 的键是 `session:window#index`（声明用坐标，不用 pane-id —— 配置是声明，
+    pane-id 是运行期产物，对不上正是要显示的东西）。
+    """
+    by_coord = {p.get("coord"): p for p in panes or []}
+    out = []
+    for key, role in sorted((decl or {}).items(), key=lambda kv: kv[1]):
+        sess, rest = key.split(":", 1)
+        win, _, idx = rest.partition("#")
+        out.append(role_state(role, by_coord.get(f"{sess}:{win}.{idx}"), at))
+    return out
+
+
 def collect_panes(with_ctx: bool) -> list[dict]:
     """列出所有 Claude pane 及其状态。
 
