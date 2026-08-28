@@ -39,7 +39,8 @@ class KeepMarks(unittest.TestCase):
         self.assertTrue(out.startswith("[标记 "), out[:40])
 
     def test_会话号和项目短名两种标记都认(self):
-        for mark in ("@7ac5", "@2f9b1c3d", "@main", "@zymix-news"):
+        # 公开仓库：fixture 不放真实项目名，`@proj-a` 一样覆盖「带连字符」这个形状
+        for mark in ("@7ac5", "@2f9b1c3d", "@main", "@proj-a"):
             with self.subTest(标记=mark):
                 long = "很长的正文。" * 120 + " " + mark
                 self.assertIn(mark, fleet.keep_marks(long, 200))
