@@ -240,6 +240,28 @@ def collect_collector() -> list[dict]:
             "v": f"{int(age // 60)} 分 {int(age % 60)} 秒前",
             "warn": age > 900,     # poll 默认 300s，超过 15 分钟就该起疑
         })
+    ob = os.path.join(BASE, "data", "outbox.ndjson")
+    if os.path.isfile(ob):
+        import json as _json
+        seen = {}
+        with open(ob, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = _json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("id"):
+                    seen.setdefault(r["id"], {}).update(r)
+        pend = [e for e in seen.values() if e.get("status") == "pending"]
+        quiet = [e for e in pend if not e.get("notified_at")]
+        # 「有草稿」本身不是问题，「有草稿而他还不知道」才是 —— 只对后者报警。
+        rows.append({"k": "待他拍板的草稿",
+                     "v": ("%d 条" % len(pend)) + (
+                         "（其中 %d 条还没推给他）" % len(quiet) if quiet else ""),
+                     "warn": bool(quiet)})
     q = os.path.join(BASE, "data", "desk_queue.ndjson")
     if os.path.isfile(q):
         with open(q, encoding="utf-8") as f:

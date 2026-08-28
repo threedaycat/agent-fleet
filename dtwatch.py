@@ -608,6 +608,150 @@ def watch_verdict(records, cid, base_ts, only_from, state, at, deadline,
     return "", None
 
 
+# ---------------------------------------------------------------- 待拍板草稿
+#
+# 问题：会话拟好了一条要发给别人的回复，然后**只活在它自己的上下文里** ——
+# 推不出去（没有可推的东西）、数不出来、会话一没就没了。
+# 2026-08-28 用户原话：「这个不太行，因为没有跟我说要回复的消息是啥」
+# —— 哨兵推送里只有别人问了什么，没有我们拟的回复。
+#
+# 存储用**只追加的 ndjson**，不用 save_json 那套读-改-写：
+# `save_json` 是原子替换但**不加锁**，多个会话同时拟稿就会互相覆盖，
+# 而覆盖掉的是「还没给他看过的草稿」——静默丢失，正是要治的病。
+# 追加 + 读时按 id 取最后一条，跟 `read_inbox` 同一套。
+
+OUTBOX = os.path.join(DATA, "outbox.ndjson")
+
+# 推送里每条草稿最多显示多少字。手机上看的，太长翻不完；
+# 全文在 `outbox show <id>`，推送里只给够他判断「这稿对不对路」的量。
+PUSH_DRAFT_CHARS = 160
+PUSH_ASK_CHARS = 60
+# 一次推送里最多详列几条，剩下的只报数 —— 一条几百字的钉钉消息没人读。
+PUSH_MAX_ITEMS = 3
+
+
+def collapse(text: str, n: int) -> str:
+    """压成一行并截断。**纯函数。**"""
+    one = " ".join((text or "").split())
+    return one if len(one) <= n else one[:n] + "…"
+
+
+def fold_outbox(lines) -> list:
+    """一堆 ndjson 行 → 每个 id 的最新状态，按创建时间升序。**纯函数。**
+
+    同一个 id 后写的覆盖先写的（drop / 标记已推送都是追加一条新的）。
+    """
+    seen = {}
+    for r in lines or ():
+        if isinstance(r, dict) and r.get("id"):
+            prev = seen.get(r["id"]) or {}
+            merged = dict(prev)
+            merged.update(r)
+            seen[r["id"]] = merged
+    return sorted(seen.values(), key=lambda r: (r.get("at") or "", r.get("id") or ""))
+
+
+def next_draft_id(entries, at) -> str:
+    """下一个草稿 id。**纯函数。** 形如 `ob-260828-3`。
+
+    不用随机数：同样的输入要能算出同样的结果，测试才不用打桩。
+    序号在**当天之内**递增，跨天从 1 开始 —— 他在手机上要打 "发3"，
+    编号必须短到能一眼看清、能手打。
+    """
+    day = at.strftime("%y%m%d")
+    pre = "ob-%s-" % day
+    used = []
+    for e in entries or ():
+        i = e.get("id") or ""
+        if i.startswith(pre):
+            try:
+                used.append(int(i[len(pre):]))
+            except ValueError:
+                pass
+    return pre + str((max(used) if used else 0) + 1)
+
+
+def make_draft(entries, at, to_label, cid, draft, about_text="",
+               about_id="", by="", single=True) -> dict:
+    """造一条待拍板草稿。**纯函数。**
+
+    `cid` 落盘但**不进推送文本** —— 它是发送句柄，二期的守护进程要用，
+    给人看没有意义（人认的是姓名）。
+    """
+    return {
+        "id": next_draft_id(entries, at),
+        "at": ts(at),
+        "to_label": to_label or "",
+        "cid": cid or "",
+        "single": bool(single),
+        "about_id": about_id or "",
+        "about_text": about_text or "",
+        "draft": draft or "",
+        "by": by or "",
+        "status": "pending",
+        "notified_at": "",
+    }
+
+
+def pending_drafts(entries) -> list:
+    """还等着他拍板的。**纯函数。**"""
+    return [e for e in fold_outbox(entries) if e.get("status") == "pending"]
+
+
+def unnotified(entries) -> list:
+    """待拍板、且还没推给他看过的。**纯函数。**
+
+    「推送被免打扰/最小间隔挡掉」和「已经给他看过了」必须分得开 ——
+    挡掉了就要留着下次再推，否则草稿静默躺着，跟没拟一样。
+    """
+    return [e for e in pending_drafts(entries) if not e.get("notified_at")]
+
+
+def format_push(fresh, total_pending: int) -> str:
+    """推到手机上的那段话。**纯函数。**
+
+    三件事必须在里面，缺一件这条推送就白推：
+      1. **拟的回复是什么** —— 这是 2026-08-28 那次的直接教训，
+         只说「有人点你的名」而不给拟稿，他没法判断；
+      2. **一共有几条待拍板** —— 「我不知道他到底有几条要发」；
+      3. **怎么答** —— 在手机上能打出来的短指令。
+    """
+    if not fresh:
+        return ""
+    head = "【待你拍板】新增 %d 条" % len(fresh)
+    if total_pending > len(fresh):
+        head += "，共 %d 条未处理" % total_pending
+    lines = [head]
+    for e in fresh[:PUSH_MAX_ITEMS]:
+        where = "私聊" if e.get("single") else "群"
+        lines.append("")
+        lines.append("[%s] 回 %s（%s）" % (e.get("id", ""),
+                                          e.get("to_label") or "?", where))
+        if e.get("about_text"):
+            lines.append("  他问：" + collapse(e["about_text"], PUSH_ASK_CHARS))
+        lines.append("  拟回：" + collapse(e.get("draft", ""), PUSH_DRAFT_CHARS))
+    if len(fresh) > PUSH_MAX_ITEMS:
+        lines.append("")
+        lines.append("（还有 %d 条，`outbox list` 看全部）" % (len(fresh) - PUSH_MAX_ITEMS))
+    lines.append("")
+    # 一期还不能从手机发出去，说清楚，别让他在手机上白打字等回音。
+    lines.append("一期还不能从手机发，要发去电脑上处理；不要了回复不管用，"
+                 "用 `outbox drop <编号>`。")
+    return "\n".join(lines)
+
+
+def mark_notified(ids, at) -> list:
+    """给「已推送」造补丁行。**纯函数。**"""
+    stamp = ts(at)
+    return [{"id": i, "notified_at": stamp} for i in ids]
+
+
+def drop_patch(entry_id: str, at, why: str = "") -> dict:
+    """给「丢弃」造补丁行。**纯函数。**"""
+    return {"id": entry_id, "status": "dropped",
+            "dropped_at": ts(at), "drop_reason": why or ""}
+
+
 def resolve_cid(records, name: str, kind: str = "single"):
     """从收件历史里认出「这个名字对应的通道」。**纯函数。**
 
@@ -850,6 +994,159 @@ def cmd_await_reply(cfg, args):
         if action == "expire":
             return finish(f"守候 {args.hours} 小时到期，「{label}」一直没有新消息。", 0)
         time.sleep(float(args.interval))
+
+
+def read_outbox() -> list:
+    """读全部草稿（已折叠）。IO 外壳。"""
+    if not os.path.exists(OUTBOX):
+        return []
+    rows = []
+    with open(OUTBOX, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return fold_outbox(rows)
+
+
+def append_outbox(rows) -> None:
+    """追加几行。IO 外壳。**只追加**，所以并发写不会互相覆盖。"""
+    if not rows:
+        return
+    os.makedirs(DATA, exist_ok=True)
+    with open(OUTBOX, "a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def push_outbox(cfg, at) -> dict:
+    """把还没给他看过的草稿推到手机。IO 外壳。
+
+    走 `send_reminder` 那条**唯一**的提醒通道 —— 免打扰时段和最小间隔对它同样
+    生效，不因为是自动化就绕过约束（这是本仓库一贯口径，见 send_reminder）。
+
+    被挡掉时**不**标 notified：挡掉了就得留着下次再推，否则草稿静默躺着，
+    跟没拟一样。这正是要治的病。
+    """
+    entries = read_outbox()
+    fresh = unnotified(entries)
+    if not fresh:
+        return {"ok": True, "skipped": "nothing_new",
+                "pending": len(pending_drafts(entries))}
+    body = format_push(fresh, len(pending_drafts(entries)))
+    res = send_reminder(cfg, body)
+    if res.get("ok"):
+        append_outbox(mark_notified([e["id"] for e in fresh], at))
+        logline("[outbox] 推了 %d 条待拍板" % len(fresh))
+    else:
+        logline("[outbox] 推送没成功 %s（%d 条仍未通知）" % (res, len(fresh)))
+    res["pushed"] = len(fresh)
+    res["body"] = body
+    return res
+
+
+def cmd_outbox(cfg, args):
+    """拟好的回复落盘 + 推到手机等他拍板。**一期不发送任何东西。**"""
+    at = now()
+    entries = read_outbox()
+
+    if args.action == "list":
+        pend = pending_drafts(entries)
+        if not pend:
+            print("没有待拍板的草稿。")
+            return 0
+        print("待拍板 %d 条：" % len(pend))
+        for e in pend:
+            flag = "" if e.get("notified_at") else "  ⚠️ 还没推给他看"
+            print("  [%s] %s → %s%s" % (e["id"], e["at"][5:16],
+                                        e.get("to_label") or "?", flag))
+            if e.get("about_text"):
+                print("      他问：%s" % collapse(e["about_text"], 70))
+            print("      拟回：%s" % collapse(e.get("draft", ""), 100))
+        return 0
+
+    if args.action == "show":
+        if not args.id:
+            print("要给 --id", file=sys.stderr)
+            return 2
+        hit = [e for e in entries if e["id"] == args.id]
+        if not hit:
+            print("没有这条草稿：%s" % args.id, file=sys.stderr)
+            return 2
+        print(json.dumps(hit[0], ensure_ascii=False, indent=1))
+        return 0
+
+    if args.action == "drop":
+        if not args.id:
+            print("要给 --id", file=sys.stderr)
+            return 2
+        hit = [e for e in entries if e["id"] == args.id]
+        if not hit:
+            print("没有这条草稿：%s" % args.id, file=sys.stderr)
+            return 2
+        if hit[0].get("status") != "pending":
+            print("这条已经是 %s 了，不用再丢" % hit[0].get("status"))
+            return 0
+        append_outbox([drop_patch(args.id, at, args.why)])
+        print("丢掉 %s（还剩 %d 条待拍板）"
+              % (args.id, len(pending_drafts(read_outbox()))))
+        return 0
+
+    if args.action == "notify":
+        res = push_outbox(cfg, at)
+        print(json.dumps({k: v for k, v in res.items() if k != "body"},
+                         ensure_ascii=False))
+        return 0 if res.get("ok") else 1
+
+    # add
+    if not args.draft:
+        print("要给 --draft（拟好的回复全文）", file=sys.stderr)
+        return 2
+    cid, n = args.cid, 1
+    if not cid:
+        if not args.to:
+            print("要么给 --cid，要么给 --to（对方姓名/群名）", file=sys.stderr)
+            return 2
+        cid, n = resolve_cid(read_inbox(apply_self_reply=False), args.to,
+                             "group" if args.group else "single")
+        if not cid:
+            print("收件历史里找不到「%s」的通道；用 --cid 直接给。" % args.to,
+                  file=sys.stderr)
+            return 2
+        if n > 1:
+            print("⚠️ 「%s」匹配到 %d 个通道，用了最近的 %s…"
+                  % (args.to, n, cid[:12]), file=sys.stderr)
+
+    about_text = args.about_text
+    if args.about_id and not about_text:
+        hit = [r for r in read_inbox(apply_self_reply=False)
+               if r.get("id") == args.about_id]
+        if hit:
+            about_text = hit[0].get("text") or ""
+
+    draft = make_draft(entries, at, args.to or "", cid, args.draft,
+                       about_text, args.about_id, args.session or fleet_sid(),
+                       single=not args.group)
+    append_outbox([draft])
+    print("落盘 %s → %s" % (draft["id"], draft["to_label"] or cid[:12]))
+
+    if args.no_notify:
+        print("（--no-notify：没推。他看不到，记得自己告诉他。）")
+        return 0
+    res = push_outbox(cfg, at)
+    if res.get("ok"):
+        print("已推到他手机（这次推了 %d 条）" % res.get("pushed", 0))
+    else:
+        # 静默失败是这里最不能有的东西：他不知道有草稿，会话以为通知过了。
+        print("⚠️ **没推出去**：%s —— 他现在还不知道有这条。"
+              "免打扰/最小间隔挡的话，下次 `outbox notify` 会补推；"
+              "急就当面告诉他。" % json.dumps(res, ensure_ascii=False),
+              file=sys.stderr)
+    return 0
 
 
 def fleet_sid() -> str:
@@ -1766,6 +2063,25 @@ def main():
                    help="只守候不登记（本进程死了回信就回落默认路由）")
     p.add_argument("--out", default="", help="结果也写到这个文件")
     p.set_defaults(fn=cmd_await_reply)
+
+    p = sub.add_parser("outbox",
+                       help="拟好的回复落盘 + 推手机等他拍板（一期不发送）")
+    p.add_argument("action", nargs="?", default="add",
+                   choices=["add", "list", "show", "drop", "notify"])
+    p.add_argument("--draft", default="", help="拟好的回复全文")
+    p.add_argument("--to", default="", help="对方姓名（群用 --to 群名 加 --group）")
+    p.add_argument("--group", action="store_true", help="--to 给的是群名")
+    p.add_argument("--cid", default="", help="直接给通道 id")
+    p.add_argument("--about-id", dest="about_id", default="",
+                   help="在回哪条 inbox 消息（会自动取它的正文当上下文）")
+    p.add_argument("--about-text", dest="about_text", default="",
+                   help="他问了什么，不给就从 --about-id 取")
+    p.add_argument("--session", default="", help="谁拟的，默认取本会话")
+    p.add_argument("--id", default="", help="show / drop 用")
+    p.add_argument("--why", default="", help="drop 的理由")
+    p.add_argument("--no-notify", action="store_true",
+                   help="只落盘不推（他就看不到，一般别用）")
+    p.set_defaults(fn=cmd_outbox)
 
     args = ap.parse_args()
     return args.fn(cfg, args)
