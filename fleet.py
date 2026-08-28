@@ -24,6 +24,7 @@ dtwatch 解决的是「钉钉的消息怎么进来、派给谁」，这个文件
 
 import argparse
 import datetime as dt
+import fcntl
 import json
 import os
 import re
@@ -1148,6 +1149,265 @@ def _ctx_kb(ctx):
     return int(m.group(1)) if m else None
 
 
+# ---------------------------------------------------------------- 自动压缩
+#
+# 现状（2026-08-28 量的）：`cmd_compact` 写得很细，但**全仓零调用方，只能手敲**。
+# 本机 7 个定时任务（三个采集、日报周报、console、caffeinate）没有一个碰上下文。
+# 用户原话：「我不能每次都手动做这些吧」。
+#
+# ⚠️ **阈值故意定得比他自己的判断线高。** 他的 CLAUDE.md 里那条是 200k，但那条
+# 是给**会话自己**用的，因为会话知道自己有没有活干到一半。外部看门狗看不出
+# 「闲着」和「等我确认下一步」的区别 —— `state=idle` 和页脚数字都区分不了。
+# 所以这里只做兜底：专治一路涨到很高还没人管的，不抢正常判断。
+# 这也正是他 CLAUDE.md 里给看门狗定的位置（"它只是兜底，不是主力"）。
+#
+# **不做 /clear。** clear 会把开 pane 时喂进去的角色定义一起切掉，
+# 那个 pane 之后就是个没有角色的裸 Claude。角色被压淡的正解是每轮注入，
+# 不是清空。
+AUTOCOMPACT_THRESHOLD_KB = 300
+AUTOCOMPACT_COOLDOWN_MINUTES = 45
+AUTOCOMPACT_MAX_PER_RUN = 3
+# 「刚刚还在动」的别压。`state=idle` 分不清「闲了半小时」和「两轮之间闲了 20 秒」——
+# 后者正是用户在跟它对话的时候。2026-08-28 第一次 dry-run 就选中了当时正在
+# 跟他对话的那个会话（523k、idle，因为那一瞬间它在等下一句）。
+# 他自己的 CLAUDE.md 写着：「正改着代码、正在多步验证的中途，压了就忘了改到哪，
+# 这种情况宁可超线也别压」。外部看门狗唯一能用的近似就是「安静够久了」。
+AUTOCOMPACT_MIN_IDLE_SECONDS = 900
+# `compact` 手敲时默认等 90 秒，那是给小会话写的。**这个功能专治大会话**，
+# 而大上下文压起来就是慢：2026-08-28 实测一个 381k 的会话，2 分 42 秒时才到 84%。
+# 90 秒超时会让每一次都报"没等到降下来"。
+AUTOCOMPACT_TIMEOUT_SECONDS = 420
+# 一轮最多 3 个 × 每个最多 7 分钟 = 一轮可能跑 21 分钟。所以**必须防重入**：
+# 定时任务间隔比一轮耗时短的时候，两个进程会同时往同一个 pane 发 /compact。
+AUTOCOMPACT_LOCK = os.path.join(DATA, "autocompact.lock")
+COMPACT_LOG = os.path.join(DATA, "compact_log.ndjson")   # 只追加：谁什么时候被压过
+
+
+def should_compact(rec, kb, threshold_kb, at, last_at=None,
+                   cooldown_minutes=AUTOCOMPACT_COOLDOWN_MINUTES,
+                   min_idle_seconds=AUTOCOMPACT_MIN_IDLE_SECONDS):
+    """这个会话现在该不该压。**纯函数。** 返回 `(该压吗, 理由)`。
+
+    理由字符串两边都要给 —— 「为什么没压」跟「为什么压了」一样需要能解释，
+    否则看门狗静默不动时没人知道是它判断过了还是它挂了。
+
+    五条，任何一条不满足就不压：
+
+    1. **读得出上下文数字**。读不出就不压 —— `parse_ctx_usage` 解析不到时
+       老实返回 None，这里必须把 None 当"不知道"，不能当"没超"也不能当"超了"。
+       页脚格式变了的话，宁可不压。
+    2. **pane 还在**（`routable`）。
+    3. **不是 busy**。压缩本质是往别人输入框发字，会打断正在输出的会话。
+    4. **超过阈值**。
+    5. **冷却期外**。压完如果没降到阈值以下（长会话可能压一次还是很高），
+       没有冷却就会每一轮都压它一次 —— 那比不压更糟。
+    6. **安静够久了**（`age >= min_idle_seconds`）。`state=idle` 只说明这一刻
+       没在输出，两轮对话之间也是 idle —— 而那正是有人在跟它说话的时候。
+       `age`（多久没动）是外部唯一能用的近似。读不出 age 也不压。
+    """
+    if kb is None:
+        return False, "读不出上下文数字（页脚解析不到），不猜"
+    if not routable(rec):
+        return False, "pane 不在了"
+    if rec.get("state") == "busy":
+        return False, "正在跑，压会打断它"
+    age = rec.get("age")
+    try:
+        idle_s = int(age) if age not in (None, "") else None
+    except (TypeError, ValueError):
+        idle_s = None
+    if idle_s is None:
+        return False, "读不出闲置时长，不敢压"
+    if idle_s >= 10 ** 6:
+        return False, "闲置时长是哨兵值（只记得这个会话，不知道它多久没动）"
+    if idle_s < min_idle_seconds:
+        return False, "%d 秒前还在动（要求安静满 %d 秒）" % (idle_s, min_idle_seconds)
+    if kb < threshold_kb:
+        return False, "%dk < 阈值 %dk" % (kb, threshold_kb)
+    if last_at:
+        try:
+            mins = (at - parse_ts(last_at)).total_seconds() / 60.0
+        except (ValueError, TypeError):
+            mins = None
+        if mins is not None and mins < cooldown_minutes:
+            return False, "%d 分钟前刚压过（冷却 %d 分钟）" % (mins, cooldown_minutes)
+    return True, "%dk ≥ 阈值 %dk 且空闲" % (kb, threshold_kb)
+
+
+def pick_compact_targets(rows, threshold_kb, at, last_by_sid=None,
+                         cooldown_minutes=AUTOCOMPACT_COOLDOWN_MINUTES,
+                         cap=AUTOCOMPACT_MAX_PER_RUN,
+                         min_idle_seconds=AUTOCOMPACT_MIN_IDLE_SECONDS):
+    """挑这一轮要压的。**纯函数。**
+
+    `rows` 是 `[(sid, rec, kb)]`，`kb` 由调用方抓屏得到（IO 在外面）。
+    返回 `(要压的 [(sid, rec, kb, 理由)], 没压的 [(sid, 理由)])`。
+
+    **按占用从高到低排，一轮最多压 cap 个。** 不一次压完全部：每次压缩都要
+    往别人输入框发字并等它降下来（默认最多 90 秒），一轮压十个会把巡检拖成
+    十几分钟，而这中间会话状态早变了 —— 拿旧读数去压是另一种"用过期的面
+    推断当前状态"。
+    """
+    take, skip = [], []
+    for sid, rec, kb in rows or ():
+        ok, why = should_compact(rec, kb, threshold_kb, at,
+                                 (last_by_sid or {}).get(sid), cooldown_minutes,
+                                 min_idle_seconds)
+        (take if ok else skip).append((sid, rec, kb, why) if ok else (sid, why))
+    take.sort(key=lambda t: -(t[2] or 0))
+    # **按 pane 去重。** 真正的资源是 pane，不是 sid：会话在同一个 pane 里重开过
+    # 之后，台账里好几个 sid 指着同一个 pane（2026-08-28 第一次 dry-run 就选中了
+    # 同一个 %458 三次，真跑会把同一个窗口压三遍）。留 kb 最大的那条。
+    seen, deduped = set(), []
+    for item in take:
+        pane = (item[1] or {}).get("pane") or ""
+        if pane and pane in seen:
+            skip.append((item[0], "跟另一个 sid 共用 pane %s，已经算过一次" % pane))
+            continue
+        seen.add(pane)
+        deduped.append(item)
+    take = deduped
+    if cap is not None and len(take) > cap:
+        for sid, rec, kb, why in take[cap:]:
+            skip.append((sid, "这轮名额满了（最多 %d 个），%dk 排在后面" % (cap, kb)))
+        take = take[:cap]
+    return take, skip
+
+
+def classify_compact_result(kb_before, kb_after, cooldown_minutes):
+    """压完一个之后，这次算什么。**纯函数。** 返回 `(类别, 说明)`。
+
+    三类，**不许混成一个 "compacted"**。2026-08-28 第一版就是全丢进 compacted，
+    于是一次"发出去了但数字没降"（压缩还在跑）被报成了成功 ——
+    假成功正是这个仓库最贵的那类 bug，不该由我自己再造一个。
+
+    实测背景：381k 的会话压一次约 4 分钟（2 分 42 秒时才到 84%）。
+    所以"超时了还没降"很常见，它**不等于失败**，只是还没到。
+    """
+    if kb_after is None:
+        return "unreadable", "压完读不出页脚数字，去那个 pane 看一眼"
+    if kb_before is not None and kb_after < kb_before:
+        return "dropped", ""
+    return "sent_not_settled", (
+        "/compact 已送达但数字还没降 —— 大上下文压起来要几分钟（实测 381k 约 4 分钟），"
+        "很可能还在跑。下一轮巡检会重新读数（冷却 %d 分钟内不会重压）" % cooldown_minutes)
+
+
+def compact_history():
+    """每个会话最后一次被自动压缩的时刻。IO 外壳。"""
+    if not os.path.exists(COMPACT_LOG):
+        return {}
+    out = {}
+    try:
+        with open(COMPACT_LOG, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("sid") and r.get("at"):
+                    out[r["sid"]] = r["at"]
+    except OSError:
+        return {}
+    return out
+
+
+def note_compacted(sid, kb_before, kb_after, at):
+    """记一笔。IO 外壳，只追加。"""
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        with open(COMPACT_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"sid": sid, "at": ts(at),
+                                "kb_before": kb_before, "kb_after": kb_after},
+                               ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def cmd_autocompact(args):
+    """巡一遍所有活会话，把涨过阈值又空闲的压掉。**兜底，不抢正常判断。**
+
+    **单实例。** 一轮最多 3 个 × 每个最多 7 分钟 = 可能跑 21 分钟，
+    比定时间隔长。拿不到锁就直接退出（不排队）—— 上一轮还在跑，
+    这一轮的读数到它跑完早就过期了，排队等于拿旧读数去压。
+
+    判据在 `should_compact` / `pick_compact_targets`（纯函数），这里只剩 IO：
+    抓每个 pane 的页脚、读冷却台账、调已有的 `cmd_compact`、记账。
+
+    **抓屏只抓「能收件且不 busy」的那批**，不是全部 155 个 —— 死会话和正在跑的
+    本来就不会被压，抓它们的屏是白花时间。
+
+    `--dry-run` 只报不做。第一次用建议先 dry-run 看一眼选中的是不是你想压的。
+    """
+    os.makedirs(DATA, exist_ok=True)
+    lock_fd = os.open(AUTOCOMPACT_LOCK, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lock_fd)
+        print(json.dumps({"ok": True, "skipped": "上一轮还在跑（拿不到锁）",
+                          "at": ts(now())}, ensure_ascii=False))
+        return 0
+
+    at = now()
+    sess = sessions()
+    rows = []
+    for sid, rec in sess.items():
+        if not routable(rec) or rec.get("state") == "busy":
+            continue
+        rows.append((sid, rec, _ctx_kb(ctx_usage(rec.get("pane", "")))))
+    hist = compact_history()
+    take, skip = pick_compact_targets(rows, args.threshold, at, hist,
+                                      args.cooldown, args.max, args.min_idle)
+
+    out = {"at": ts(at), "scanned": len(rows), "of_total": len(sess),
+           "threshold_kb": args.threshold, "dry_run": bool(args.dry_run),
+           "picked": [{"who": disp_of(r), "pane": r.get("pane", ""),
+                       "kb": kb, "why": why} for _, r, kb, why in take]}
+    # 没选中的**也要报**，而且报理由 —— 看门狗静默不动时，
+    # 「它判断过了」和「它挂了」必须能分开。
+    unreadable = [s for s in skip if "读不出" in s[1]]
+    out["skipped"] = len(skip)
+    out["unreadable_ctx"] = len(unreadable)
+    if args.verbose:
+        out["skip_detail"] = [{"sid": sid[:4], "why": why} for sid, why in skip]
+
+    if args.dry_run or not take:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return 0
+
+    # 结果分三类，**不许混成一个 "compacted"**。
+    # 2026-08-28 第一版就是全丢进 compacted，于是一次"发出去了但数字没降"
+    # （压缩还在跑）被报成了成功 —— 假成功正是这个仓库最贵的那类 bug，
+    # 不该由我自己再造一个。
+    dropped, pending_still, unknown = [], [], []
+    for sid, rec, kb, why in take:
+        kb_before = kb
+        # 复用已有那条路：三道护栏 + 等它真降下来 + 把被冲掉的任务原文重发。
+        # **不在这里重写一份**，那会立刻变成第二份真相。
+        rc = cmd_compact(argparse.Namespace(
+            target=sid, force=False, timeout=args.timeout))
+        kb_after = _ctx_kb(ctx_usage(rec.get("pane", "")))
+        note_compacted(sid, kb_before, kb_after, now())
+        row = {"who": disp_of(rec), "pane": rec.get("pane", ""), "rc": rc,
+               "kb": "%s → %s" % (kb_before, kb_after)}
+        kind, note = classify_compact_result(kb_before, kb_after, args.cooldown)
+        if note:
+            row["note"] = note
+        {"dropped": dropped, "sent_not_settled": pending_still,
+         "unreadable": unknown}[kind].append(row)
+    out["compacted"] = dropped
+    out["sent_not_settled"] = pending_still
+    out["unreadable_after"] = unknown
+    out["summary"] = "真降下来 %d 个，发了还没降 %d 个，读不出 %d 个" % (
+        len(dropped), len(pending_still), len(unknown))
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+    return 0
+
+
 def cmd_compact(args):
     """帮某个会话做一次 /compact，压完自动把它原来那条任务原文重发一遍。
 
@@ -1429,6 +1689,26 @@ def main() -> int:
     p.add_argument("--force", action="store_true", help="绕过三道护栏（busy/pending-input/awaiting-choice）")
     p.add_argument("--timeout", type=int, default=90, help="等压完的最长秒数（默认 90）")
     p.set_defaults(fn=cmd_compact)
+
+    p = sub.add_parser("autocompact",
+                       help="巡检：涨过阈值又空闲的会话自动 /compact（兜底用）")
+    p.add_argument("--threshold", type=int, default=AUTOCOMPACT_THRESHOLD_KB,
+                   help="超过多少 k 才压（默认 %d，故意比自判线高，只做兜底）"
+                        % AUTOCOMPACT_THRESHOLD_KB)
+    p.add_argument("--cooldown", type=int, default=AUTOCOMPACT_COOLDOWN_MINUTES,
+                   help="同一个会话多久内不再压（默认 %d 分钟）"
+                        % AUTOCOMPACT_COOLDOWN_MINUTES)
+    p.add_argument("--max", type=int, default=AUTOCOMPACT_MAX_PER_RUN,
+                   help="一轮最多压几个（默认 %d）" % AUTOCOMPACT_MAX_PER_RUN)
+    p.add_argument("--min-idle", type=int, default=AUTOCOMPACT_MIN_IDLE_SECONDS,
+                   help="要安静满多少秒才敢压（默认 %d）——两轮对话之间也是 idle"
+                        % AUTOCOMPACT_MIN_IDLE_SECONDS)
+    p.add_argument("--timeout", type=int, default=AUTOCOMPACT_TIMEOUT_SECONDS,
+                   help="每个等压完的最长秒数（默认 %d；手敲那条是 90，"
+                        "但大上下文压起来要几分钟）" % AUTOCOMPACT_TIMEOUT_SECONDS)
+    p.add_argument("--dry-run", action="store_true", help="只报不做")
+    p.add_argument("--verbose", action="store_true", help="把没选中的理由也列出来")
+    p.set_defaults(fn=cmd_autocompact)
 
     p = sub.add_parser("board", help="生成网页版 board（终端版已退役）")
     p.add_argument("--loop", type=int, default=0, help="每 N 秒重生成一次（常驻）")
