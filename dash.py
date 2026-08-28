@@ -185,6 +185,12 @@ def pad(text: str, width: int) -> str:
 LABEL_W = 10
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
+# 五种角色状态各给一个不同记号。`never` 和 `unknown` 故意不共用 ——
+# 「从没干过活」是结论，「读不出」是没有结论，屏幕上必须能分开。
+ROLE_MARK = {"missing": "✗", "never": "○", "stale": "◐", "unknown": "?", "live": "●"}
+ROLE_TONE = {"missing": "bad", "never": "bad", "stale": "warn",
+             "unknown": "mute", "live": "ok"}
+
 
 def compose(snap: dict, width: int, frame: int = 0, eased=None) -> list[tuple]:
     """一屏 → `[(文字, tone), …]`。`eased` 是每个 pane 当前画到的百分比。"""
@@ -239,6 +245,19 @@ def compose(snap: dict, width: int, frame: int = 0, eased=None) -> list[tuple]:
     else:
         row("哨兵", f"点过名还没处理 {st} 条", "warn" if st else "ok")
 
+    # ---- 角色：声明了六个，实际有几个真干过活
+    roles = snap.get("roles")
+    if roles is None:
+        row("角色", "读不出", "bad")
+    else:
+        bad = [r for r in roles if r["state"] != "live"]
+        row("角色", f"{len(roles) - len(bad)}/{len(roles)} 在干活",
+            "ok" if not bad else "warn")
+        for r in bad:
+            row("", f"{ROLE_MARK.get(r['state'], '?')} {pad(r['role'], 8)} "
+                    f"{pad(clip(r['coord'] or '—', 20), 20)} {r['note']}",
+                ROLE_TONE.get(r["state"], "warn"))
+
     # ---- 会话上下文
     panes = snap.get("panes")
     if panes is None:
@@ -286,6 +305,13 @@ def snapshot(with_ctx: bool = True) -> dict:
     grab("collector", console.collect_collector)
     grab("panes", lambda: console.collect_panes(with_ctx))
     grab("stale", lambda: len(dtwatch.stale_at_me(None)) if dtwatch else None)
+    # 角色**必须**在 panes 之后算，而且 panes 读不出时角色也只能是读不出 ——
+    # 拿一个空 pane 列表去比对，会把六个角色全报成 missing（假警报）。
+    if snap.get("panes") is None:
+        snap["roles"] = None
+    else:
+        grab("roles", lambda: console.role_report(
+            snap["panes"], console.declared_roles(), time.time()))
     return snap
 
 

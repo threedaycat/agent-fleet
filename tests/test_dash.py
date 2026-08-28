@@ -34,7 +34,7 @@ def snap(**over):
     base = {"at": "16:00:00", "checks": [{"ok": True, "label": "依赖 tmux", "note": ""}],
             "services": [{"name": "console", "state": "OK", "when": "常驻", "note": ""}],
             "collector": [{"k": "上次采集", "v": "1 分前", "warn": False}],
-            "stale": 0, "panes": [pane()]}
+            "stale": 0, "panes": [pane()], "roles": []}
     base.update(over)
     return base
 
@@ -225,7 +225,10 @@ class Snapshot(unittest.TestCase):
                   "collect_collector", "collect_panes"):
             setattr(dash.console, n, boom)
         out = text_of(dash.compose(dash.snapshot(with_ctx=False), 100))
-        self.assertEqual(out.count("读不出"), 5)   # 五段全部如实说读不出
+        # 六段（自检/服务/采集/哨兵/角色/会话）全部如实说读不出。
+        # 这个数字加过一次：加「角色」区块时从 5 改成 6 —— 写死数字的代价，
+        # 但比「至少有一个读不出」这种断言强，后者漏一整段都发现不了。
+        self.assertEqual(out.count("读不出"), 6)
 
 
 class Eased(unittest.TestCase):

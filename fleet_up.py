@@ -434,6 +434,25 @@ def cmd_doctor(args) -> int:
     else:
         print("  (没有配置，跳过)")
 
+    # 上面查的是「角色**文件**在不在」——六个全打勾，可 2026-08-28 实测
+    # doctor/duty/watch 三个角色上下文 0k（一句话都没说过）、remote 的 pane
+    # 根本不存在。**文件齐全跟角色在干活是两件事**，所以这里再查一遍后者。
+    print("\n角色在干活吗")
+    try:
+        import time as _time
+
+        import console as _console          # 故意在函数里导：console 顶层导 fleet_up，
+        _at = _time.time()                  # 模块级互导会成环。跑到这里 fleet_up 已加载完。
+        _panes = _console.collect_panes(True)
+        _rep = _console.role_report(_panes, _console.declared_roles(), _at)
+    except Exception as e:                  # 不许静默 —— 静默失败会伪装成「没问题」
+        print(f"  (查不了：{type(e).__name__}: {e})")
+        _rep = []
+    for r in _rep:
+        line(r["state"] == "live", f"{r['role']}  {r['coord'] or '—'}", r["note"])
+    if _rep and all(r["state"] == "live" for r in _rep):
+        print("  (六个都在干活)")
+
     print("\n个人工作记忆")
     mems = load_mem()
     if not mems:
