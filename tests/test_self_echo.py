@@ -156,6 +156,36 @@ class NoBlacklist(unittest.TestCase):
         self.assertNotIn("except Exception:                              # noqa: BLE001\n            pass",
                          src, "不许每条消息一个静默 except")
 
+    def test_回声要被消费掉不能只跳过(self):
+        """**这条是补票：第一版只 continue 不 consume，线上无限循环。**
+
+        `collect` 的契约是「不写游标」（消费由调用方决定）。在它里面
+        `continue` 跳过一条而不消费，游标就永远过不去 —— 同一条回声每 8 秒
+        被重新识别一次。2026-08-28 线上 log 里同一条刷了几十行：
+        16:09:17 / :21 / :30 / :37 / :39 / :48 / :57 / 16:10:07 …
+
+        正确做法照抄旁边的「便签」分支：collect 只打标记，
+        push_once 消费掉、不派活。
+        """
+        import inspect, dtcc
+        col = inspect.getsource(dtcc.collect)
+        col = col.replace(dtcc.collect.__doc__ or "", "")
+        self.assertIn("self_echo", col, "collect 要打标记")
+        self.assertNotIn("logline(f\"[push] 自己的回声，不当指令", col,
+                         "collect 里不该直接跳过——它没有消费权")
+
+        once = inspect.getsource(dtcc.push_once)
+        once = once.replace(dtcc.push_once.__doc__ or "", "")
+        self.assertIn("self_echo", once, "push_once 要处理它")
+        i_echo = once.index("self_echo")
+        i_react = once.index("react(cfg, mid)")
+        self.assertLess(i_echo, i_react,
+                        "回声分支要排在 react 之前——给自己的推送贴回执"
+                        "只是在他手机上多一个红点")
+        # 消费掉，否则游标过不去
+        seg = once[i_echo:i_react]
+        self.assertIn("consume(", seg, "回声必须被消费掉")
+
     def test_记账在发送出口而不是调用方(self):
         # 漏事形态：把记账写在每个调用 send_reminder 的地方，
         # 下一个调用方忘了写，那条通知就又变成指令了。

@@ -256,11 +256,12 @@ def collect(cfg, since: str, accept_bare: bool = True) -> tuple[list[dict], str]
         # 按**记账**认（dtwatch.note_self_send 在发送出口记指纹），不按前缀名单认：
         # OUT_MARKERS 是黑名单，dtwatch 那边的【哨兵】/【时效】/【待你拍板】
         # 一个都不在里面，而且每加一种新通知就会再漏一次。
-        if echo_check is None:
-            pass                    # 这一轮问不成，已经在循环外报过一次
-        elif echo_check(t):
-            logline(f"[push] 自己的回声，不当指令 :: {t[:50]}")
-            continue
+        # 我们自己推到自聊天的通知，8 秒后会在这里被读回来。
+        # **只打标记，不在这里 continue** —— 这个函数的契约是「不写游标」
+        # （见上面 docstring），跳过而不消费的话游标永远过不去，同一条会被
+        # 每 8 秒重新识别一次，无限循环。2026-08-28 第一版就是这么写的，
+        # 线上 log 里同一条 8 秒一遍刷了几十行。消费由 push_once 决定。
+        self_echo = bool(echo_check) and echo_check(t)
         prefixed, body = strip_prefix(t)
         q = quoted_of(m)
         # 引用了 CC 的播报 = 明确在跟我说话
@@ -280,7 +281,10 @@ def collect(cfg, since: str, accept_bare: bool = True) -> tuple[list[dict], str]
                # （裸句子也算），只用来看他的表达方式。
                "prefixed": prefixed or replying_to_cc,
                # 便签：贴表情就完事，不派给任何人（push_once 里处理）
-               "note_only": note_only}
+               "note_only": note_only,
+               # 自己推的通知被读回来了：消费掉、不派活、**也不贴表情**
+               # （给自己的推送贴回执只是在他手机上多一个红点）
+               "self_echo": self_echo}
         rec.update(q)
         out.append(rec)
     return out, newest
@@ -876,6 +880,15 @@ def push_once(cfg, wake: bool = True) -> int:
     held, done = [], 0
     for c in cmds:
         mid, text = c["id"], c["text"]
+
+        # 自己推出去的通知被读回来了 —— 消费掉就完事。
+        # **排在 react 之前**：其余所有分支都得先贴回执（那是他明确要过的），
+        # 但这一条是我们自己发的，给它贴表情只是在他手机上多一个红点。
+        if c.get("self_echo"):
+            consume([mid])
+            logline(f"[push] 自己的回声，消费掉不派活 :: {text[:50]}")
+            done += 1
+            continue
 
         # ★ 回执必须是**这个循环里的第一件事**，在路由、叫醒、内建指令之前。
         # 2026-07-30 19:xx 他在手机上明确抱怨「一条都没有及时回复，连个收到的
