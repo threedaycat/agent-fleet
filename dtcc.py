@@ -150,8 +150,12 @@ def self_conv_id(cfg) -> str:
 
 
 def send(cfg, text: str) -> tuple[bool, str]:
+    # `--ai-tag=false` 不能省：dws 默认 true，会给消息打「通过AI发送」角标。
+    # 那个角标会被引用、被截图、被带进汇报。用户的长期口径就是不要它。
+    # （2026-08-28 才发现全仓一处都没加过 —— 在这之前每条提醒都带着角标。）
     _, err = dws(["chat", "message", "send",
                   "--open-dingtalk-id", cfg["self"]["open_dingtalk_id"],
+                  "--ai-tag=false",
                   "--text", text])
     if err:
         logline(f"[send] FAILED {err} :: {text[:80]}")
