@@ -622,12 +622,100 @@ def watch_verdict(records, cid, base_ts, only_from, state, at, deadline,
 
 OUTBOX = os.path.join(DATA, "outbox.ndjson")
 
+# ---------------------------------------------------------------- 自己发的回声
+#
+# 问题（2026-08-28 坐实）：系统推到自聊天的每一条提醒，8 秒后被 dtcc 的
+# push-loop 读回来，**当成他打的指令**派给一个 Claude 会话并叫醒它。
+# 实测 10:31 / 10:32 / 11:17 三条 `[push] target=workos/5380` 全是系统自己的推送。
+#
+# 原来的防线是 `dtcc.OUT_MARKERS = ("【CC", "【dtwatch", "【dtcc")` —— **黑名单**。
+# 而 dtwatch 推的是 `【哨兵】`/`【时效·…】`/`【待你拍板】`/`【台账任务…】`/
+# `【picker】`，一个都不在里面。补前缀能修眼前这几个，但下一个新通知照样静默
+# 变成指令 —— 这正是今天刚记过一遍的教训（白名单不是黑名单）。
+#
+# 所以改成**记账**：发出去的时候记一条正文指纹，读回来的时候按指纹认出自己。
+# 跟 `dtcc.head_of` 是同一套（send 只拿得到 openTaskId，拿不到 openMessageId，
+# 所以只能靠文本认）。加新通知不用改任何名单。
+#
+# 失败方向：指纹没对上 → 当成指令（就是今天的行为，不退步）；
+# 而误杀要求他一字不差打出某条推送的前 80 个字符，实际不会发生。
+SENT_SELF = os.path.join(DATA, "sent_self.ndjson")
+SENT_SELF_WINDOW_MINUTES = 90     # 超过这么久的回声不再认，免得老指纹误杀新消息
+SENT_SELF_KEEP = 200              # 读盘只看最后这么多行
+
 # 推送里每条草稿最多显示多少字。手机上看的，太长翻不完；
 # 全文在 `outbox show <id>`，推送里只给够他判断「这稿对不对路」的量。
 PUSH_DRAFT_CHARS = 160
 PUSH_ASK_CHARS = 60
 # 一次推送里最多详列几条，剩下的只报数 —— 一条几百字的钉钉消息没人读。
 PUSH_MAX_ITEMS = 3
+
+
+def send_head(text: str) -> str:
+    """正文指纹：压平空白取前 80 字。**纯函数。**
+
+    跟 `dtcc.head_of` 同一套口径。取头不取全文，因为钉钉那边偶尔会把长消息
+    截断或改写尾部，而头部稳定。
+    """
+    return re.sub(r"\s+", " ", (text or "").strip())[:80]
+
+
+def is_self_echo(text: str, ring, at, minutes: float = SENT_SELF_WINDOW_MINUTES) -> bool:
+    """这条是不是我们自己刚发出去的那条。**纯函数。**
+
+    要求**指纹完全相等**且在窗口内 —— 前缀/子串匹配会误杀他引用我们播报时
+    自己写的话。
+    """
+    head = send_head(text)
+    if not head:
+        return False
+    for e in reversed(list(ring or ())):
+        if (e.get("head") or "") != head:
+            continue
+        stamp = e.get("at") or ""
+        if not stamp:
+            continue
+        try:
+            if (at - parse_ts(stamp)).total_seconds() <= minutes * 60:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def note_self_send(text: str, at) -> None:
+    """记一条「这是我们自己发的」。IO 外壳，只追加。"""
+    head = send_head(text)
+    if not head:
+        return
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        with open(SENT_SELF, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"head": head, "at": ts(at)},
+                               ensure_ascii=False) + "\n")
+    except OSError:                                       # noqa: BLE001
+        pass          # 记不上账最多退回今天的行为，不该让发送本身失败
+
+
+def recent_self_sends() -> list:
+    """最近发出去的指纹。IO 外壳，只读文件末尾若干行。"""
+    if not os.path.exists(SENT_SELF):
+        return []
+    try:
+        with open(SENT_SELF, encoding="utf-8") as f:
+            lines = f.readlines()[-SENT_SELF_KEEP:]
+    except OSError:                                       # noqa: BLE001
+        return []
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
 
 
 def collapse(text: str, n: int) -> str:
@@ -1701,6 +1789,9 @@ def send_reminder(cfg, text: str, force: bool = False,
                   "--text", text])
     if err:
         return {"ok": False, "error": err}
+    # 记一笔「这条是我们自己发的」——否则 8 秒后 push-loop 会把它读回来当成
+    # 他打的指令。记账必须在这里（唯一的发送出口），不是在每个调用方。
+    note_self_send(text, now())
     if touch_interval:
         state = load_json(STATE, {})      # 重读：dws 那几十秒里别的命令可能写过
         state["last_reminder_at"] = ts(now())
