@@ -1,6 +1,12 @@
 # 把待办混进 picker —— 方案
 
-**状态：方案已定，picker 侧改动待落地。**
+**状态：picker 侧已落地并接通（2026-08-28 实测）。**
+
+`CLAUDE_TMUX_EXTRA_CMD` 的 `list` / `preview` / `action` 三个动作在
+`bin/list-rows.sh:47`、`bin/preview-row.sh:27`、`bin/claude-tmux-picker.sh:270` 都在读。
+那个环境变量在 `~/.tmux.conf.local` 的 `bind g` 那一行给 —— **只能给在那儿**：
+picker 是 `display-popup` 起的，不经过交互 shell，写进 `.zshrc` 到不了它手上。
+（在这之前变量一直没设，所以 `picker_items.py` 从写完到 08-28 一次都没被调用过。）
 
 **本方案不需要修改 claude-tmux-sessions 的 `hooks/tmux_status_update.py`** ——
 只读它写出来的 `status.json`，依赖的字段见第六节，那节就是跟写入端的接口约定。
