@@ -138,6 +138,38 @@ def stuck_sessions(live: dict, backlog: dict) -> list:
 
 # ---------------------------------------------------------------- list
 
+def console_mod():
+    """懒导 console。**失败不静默** —— 静默会让「系统状态读不出」看起来像一切正常。
+    dtcc.dtwatch_mod 那次就是被 `except: pass` 藏了三天。"""
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import console
+    return console
+
+
+def system_lines() -> list[str]:
+    """「系统状态」区。
+
+    ⚠️ **这里只允许放便宜的判据。** picker 侧给 `list` 的死线是
+    `CLAUDE_TMUX_EXTRA_TIMEOUT`（默认 2 秒），超时 `run_with_deadline` 会把
+    **全部**附加条目一起丢掉 —— 不只是这一条。实测 `list` 本身已经用掉
+    0.5–0.8 秒，而每个 pane 抓一次屏要 0.23 秒。所以角色和上下文（都要抓屏）
+    留给 `preview`，它是选中才跑、没有死线。
+    """
+    try:
+        c = console_mod()
+        checks, svcs = c.collect_checks(), c.collect_services()
+        ok_c = sum(1 for x in checks if x["ok"])
+        ok_s = sum(1 for x in svcs if c.TONE.get(x["state"]) == "ok")
+        bad = ok_c != len(checks) or ok_s != len(svcs)
+        mark = f"{YEL}[*]{OFF}" if bad else f"{DIM}[*]{OFF}"
+        body = f"自检 {ok_c}/{len(checks)}   服务 {ok_s}/{len(svcs)}"
+    except Exception as e:
+        mark, body = f"{RED}[*]{OFF}", f"读不出（{type(e).__name__}: {e}）"
+    return [header(f"{DIM}▾ 系统{OFF}"),
+            row(f"  {mark} {col('系统状态', 22)}  {DIM}{body}{OFF}", "system:dash")]
+
+
 def cmd_list() -> int:
     live = fleet.sessions()
     backlog = session_backlog()
@@ -148,10 +180,15 @@ def cmd_list() -> int:
     queues.sort(key=lambda x: -x[1])
 
     total = len(atme) + len(stuck) + len(queues)
+    # 「待办」区没事就整个不出现；「系统」区**永远出现** ——
+    # 「现在没事」正是最该能一眼确认系统本身还活着的时候。
     if not total:
-        return 0                       # 没事就整个区都不出现
+        print("\n".join(system_lines()))
+        return 0
 
-    lines = [header(f"{RED}▾ 待办 · {total}{OFF}")]
+    # 系统区排在**最前面**：实测「待办」区有 396 条（@我的积压全量倒进来），
+    # 系统状态放后面就落在第 397 行 —— 等于看不见。它只占两行，值得占最上面。
+    lines = list(system_lines()) + [header(f"{RED}▾ 待办 · {total}{OFF}")]
 
     for r in atme:
         text, _ = fleet.split_media(r.get("text") or "")
@@ -191,6 +228,17 @@ def find_atme(mid: str):
 
 def cmd_preview(item_id: str) -> int:
     kind, _, key = item_id.partition(":")
+
+    if kind == "system":
+        # 重活都在这儿：抓屏、角色、上下文。preview 是选中才跑，没有死线。
+        try:
+            import dash
+            snap = dash.snapshot(with_ctx=True)
+            for text, tone in dash.compose(snap, 58):
+                print(dash.paint(text, tone, color=True))
+        except Exception as e:
+            print(f"{RED}系统状态读不出{OFF}：{type(e).__name__}: {e}")
+        return 0
 
     if kind == "atme":
         r = find_atme(key)
@@ -270,6 +318,18 @@ def wake(sid: str, task: str) -> int:
 
 def cmd_action(item_id: str) -> int:
     kind, _, key = item_id.partition(":")
+
+    if kind == "system":
+        # 开一个常驻窗口，而不是在弹窗里跑 —— 弹窗一关就没了。
+        # 已经有同名窗口就跳过去，不重复开。
+        target = os.environ.get("CALLER_PANE") or ""
+        sess = fleet.sh(["tmux", "display-message", "-p", "-t", target,
+                         "#{session_name}"])[1] if target else ""
+        cmd = ["tmux", "new-window"] + (["-t", sess] if sess else []) + \
+              ["-n", "dash", f"{sys.executable} {os.path.join(HERE, 'dash.py')}"]
+        rc, out = fleet.sh(cmd)
+        print("已开一个 dash 窗口" if rc == 0 else f"开窗失败：{out}")
+        return 0
 
     if kind == "atme":
         r = find_atme(key)
