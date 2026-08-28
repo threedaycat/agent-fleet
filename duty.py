@@ -61,7 +61,8 @@ REPORTS = os.path.join(DATA, "duty_reports.ndjson")
 STATE = os.path.join(DATA, "duty_state.json")
 LOCK = os.path.join(DATA, "duty.lock")
 
-BATCH = 12                    # 一轮最多给它看几条 —— 319 条全塞进去会爆上下文
+BATCH = 12                    # 一轮最多给它看几条 —— 320 条全塞进去会爆上下文
+FRESH_SLOTS = 4               # 这 12 个名额里留几个给**最新**的，见 pick_batch
 INTERVAL_MINUTES = 60
 # 实测：12 条一轮跑 2 分 42 秒（2026-08-28，sonnet-5）。420 是留一倍余量 ——
 # 240 的时候只剩 78 秒margin，机器一忙就会超时，而超时那一轮是白花的。
@@ -94,17 +95,32 @@ def project(rec: dict) -> dict:
     }
 
 
-def pick_batch(items: list[dict], reported: set, cap: int = BATCH) -> list[dict]:
+def pick_batch(items: list[dict], reported: set, cap: int = BATCH,
+               fresh_slots: int = FRESH_SLOTS) -> list[dict]:
     """挑这一轮给 duty 看哪些。**纯函数。**
 
-    只做三件事：滤掉报过的、按时间**从旧到新**、截到 cap。
+    滤掉报过的之后，名额**分两份**：
 
-    为什么从旧到新：积压 319 条，最旧的那些最可能已经错过时效，而"错过了"本身
-    就是要上报的事。按新到旧排会让最旧的永远排在第 320 位，永远轮不到。
+    - `fresh_slots` 个给**最新**的；
+    - 剩下的给**最旧**的。
+
+    为什么不能只按一个方向排 —— 两个方向各有一个失效模式，实测都会发生：
+
+    - **只从旧到新**：积压 320 条、一轮 12 条、每小时一轮 → 一条刚到的紧急消息
+      排在第 321 位，**要等 27 小时才被看到**。
+    - **只从新到旧**：最旧的永远排在队尾、永远轮不到，而"已经错过时效"本身
+      就是最该上报的事。
+
+    所以两头都取。返回的顺序仍然按时间升序（读起来是时间线）。
     """
-    fresh = [r for r in items if r.get("id") not in reported]
-    fresh.sort(key=lambda r: r.get("time") or "")
-    return fresh[:cap]
+    pending = [r for r in items if r.get("id") not in reported]
+    pending.sort(key=lambda r: r.get("time") or "")
+    if len(pending) <= cap:
+        return pending
+    n_fresh = max(0, min(fresh_slots, cap))
+    newest = pending[len(pending) - n_fresh:] if n_fresh else []
+    oldest = pending[:cap - n_fresh]
+    return sorted(oldest + newest, key=lambda r: r.get("time") or "")
 
 
 def build_prompt(role_text: str, triage_text: str, batch: list[dict]) -> str:
