@@ -305,6 +305,60 @@ def ask_claude(prompt: str, timeout: int = TIMEOUT_SECONDS) -> tuple[int, str, s
 # ---------------------------------------------------------------- 命令
 
 
+def push_to_outbox(escalate: list[dict], at: dt.datetime) -> int:
+    """把上报的事送进 outbox，走 `kind="ask"`。返回送了几条。
+
+    为什么不做成草稿：outbox 的草稿是**待发消息**（有收件人、有拟好的正文），
+    而 duty 产出的是「要他一句判断」—— 没有收件人，`suggest` 是给他的建议不是
+    给对方的回复。硬塞成草稿会让 console 那行「待他拍板的草稿 N 条」变成谎话。
+
+    `duty.md` 的边界写着「不代他回任何消息」，所以这里**不拟回复稿**。
+
+    落盘失败不抛 —— 报告已经写进 `duty_reports.ndjson` 了，推送失败不该让整轮作废。
+    但**要报出去**（返回 -1），静默失败会让他以为"没有事要处理"。
+    """
+    if not escalate:
+        return 0
+    try:
+        import dtwatch
+        entries = dtwatch.read_outbox()          # 已经折叠过了
+        fresh = []
+        for it in escalate:
+            # 编号要连着排，所以每次都把这一轮已经造出来的也算进去 ——
+            # 只传 `entries` 的话三条 ask 会拿到同一个 id。
+            fresh.append(dtwatch.make_ask(entries + fresh, at,
+                                          about_text=it.get("why") or "",
+                                          suggest=it.get("suggest") or "",
+                                          about_id=it.get("id") or "", by="duty"))
+        dtwatch.append_outbox(fresh)
+        return len(fresh)
+    except Exception as e:
+        print(f"（送 outbox 失败：{type(e).__name__}: {e}）", file=sys.stderr)
+        return -1
+
+
+def notify_outbox():
+    """把 outbox 里还没推给他的推到手机。返回推了几条，失败返回 -1。
+
+    不自己拼推送文本、不自己发 —— 全走 `dtwatch.push_outbox`，那条是**唯一**
+    的提醒通道，免打扰时段和最小间隔对它同样生效。被挡掉时它不标 notified，
+    所以留着下次再推，不会静默丢掉。
+    """
+    try:
+        import dtwatch
+        # ⚠️ 必须传真配置。给 `{}` 的话免打扰时段和最小间隔全部失效 ——
+        # 那两条约束正是「不因为是自动化就绕过」的那一条口径。
+        cfg = dtwatch.load_json(dtwatch.CONFIG_PATH, None)
+        if not cfg:
+            print(f"（读不到 {dtwatch.CONFIG_PATH}，不推）", file=sys.stderr)
+            return -1
+        res = dtwatch.push_outbox(cfg, now())
+        return res.get("pushed", 0) if res.get("ok") else -1
+    except Exception as e:
+        print(f"（推送失败：{type(e).__name__}: {e}）", file=sys.stderr)
+        return -1
+
+
 def cmd_run(args) -> int:
     os.makedirs(DATA, exist_ok=True)
     lock = open(LOCK, "w")
@@ -358,6 +412,12 @@ def cmd_run(args) -> int:
 
     rep.update(at=res["at"], batch=[b["id"] for b in batch])
     append_report(rep)
+    res["to_outbox"] = push_to_outbox(rep["escalate"], at)
+    # 写进 outbox 还不够：`push_outbox` 全仓只有手敲 `outbox notify` 会调到，
+    # 没有任何定时任务碰它 —— 又是「写了命令没人调」。duty 自己推一下。
+    # 免打扰时段和最小间隔由 send_reminder 管，被挡掉就留着下次，不会丢。
+    if res["to_outbox"] > 0:
+        res["pushed"] = notify_outbox()
     state["last_run"] = res["at"]
     write_state(state)
     res.update(escalate=len(rep["escalate"]), absorbed=len(rep["absorbed"]))

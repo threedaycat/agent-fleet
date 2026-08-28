@@ -759,6 +759,37 @@ def next_draft_id(entries, at) -> str:
     return pre + str((max(used) if used else 0) + 1)
 
 
+# outbox 里有两种东西，**推送走同一条管道，但计数必须分开**。
+# 混在一起会让 console 那行「待他拍板的草稿 N 条」变成谎话：他看到 5 条会以为
+# 有 5 条待发消息，其实其中几条根本没有收件人。
+KIND_DRAFT = "draft"   # 有收件人、有拟好的正文，批准后要发出去
+KIND_ASK = "ask"       # 没有收件人，要的是他一句判断（duty 上报的就是这种）
+
+
+def entry_kind(e) -> str:
+    """一条 outbox 记录是哪种。**纯函数。**
+
+    ⚠️ **没有 `kind` 字段 = 草稿**，不是「未知」。`kind` 是 2026-08-28 才加的，
+    在那之前落盘的每一条都是草稿。把老记录当成未知会让它们从计数里消失 ——
+    那是把「读不出」和「不存在」搞混的反面：这里**有**确定答案，别装作没有。
+    """
+    k = (e or {}).get("kind")
+    return k if k in (KIND_DRAFT, KIND_ASK) else KIND_DRAFT
+
+
+def make_ask(entries, at, about_text, suggest, about_id="", by="") -> dict:
+    """造一条「要他拿主意」。**纯函数。**
+
+    跟草稿共用一套字段，只是 `to_label` / `cid` / `draft` 一律空 ——
+    它没有收件人，也没有要发出去的正文。
+    """
+    e = make_draft(entries, at, to_label="", cid="", draft="",
+                   about_text=about_text, about_id=about_id, by=by, single=False)
+    e["kind"] = KIND_ASK
+    e["suggest"] = suggest or ""
+    return e
+
+
 def make_draft(entries, at, to_label, cid, draft, about_text="",
                about_id="", by="", single=True) -> dict:
     """造一条待拍板草稿。**纯函数。**
@@ -776,14 +807,29 @@ def make_draft(entries, at, to_label, cid, draft, about_text="",
         "about_text": about_text or "",
         "draft": draft or "",
         "by": by or "",
+        "kind": KIND_DRAFT,
+        "suggest": "",
         "status": "pending",
         "notified_at": "",
     }
 
 
-def pending_drafts(entries) -> list:
-    """还等着他拍板的。**纯函数。**"""
+def pending_entries(entries) -> list:
+    """还等着他拍板的，**两种都算**。**纯函数。**"""
     return [e for e in fold_outbox(entries) if e.get("status") == "pending"]
+
+
+def pending_drafts(entries) -> list:
+    """待发的草稿（有收件人那种）。**纯函数。**
+
+    名字必须名副其实 —— console 那行写的就是「草稿」，把 ask 混进来这个数就是假的。
+    """
+    return [e for e in pending_entries(entries) if entry_kind(e) == KIND_DRAFT]
+
+
+def pending_asks(entries) -> list:
+    """等他拿个主意的。**纯函数。**"""
+    return [e for e in pending_entries(entries) if entry_kind(e) == KIND_ASK]
 
 
 def unnotified(entries) -> list:
@@ -792,7 +838,7 @@ def unnotified(entries) -> list:
     「推送被免打扰/最小间隔挡掉」和「已经给他看过了」必须分得开 ——
     挡掉了就要留着下次再推，否则草稿静默躺着，跟没拟一样。
     """
-    return [e for e in pending_drafts(entries) if not e.get("notified_at")]
+    return [e for e in pending_entries(entries) if not e.get("notified_at")]
 
 
 def format_push(fresh, total_pending: int) -> str:
@@ -806,13 +852,29 @@ def format_push(fresh, total_pending: int) -> str:
     """
     if not fresh:
         return ""
-    head = "【待你拍板】新增 %d 条" % len(fresh)
+    n_ask = sum(1 for e in fresh if entry_kind(e) == KIND_ASK)
+    n_draft = len(fresh) - n_ask
+    if n_ask and not n_draft:
+        head = "【等你拿主意】新增 %d 条" % n_ask
+    elif n_ask:
+        head = "【待你拍板】新增 %d 条（%d 条待发、%d 条等你拿主意）" % (
+            len(fresh), n_draft, n_ask)
+    else:
+        head = "【待你拍板】新增 %d 条" % len(fresh)
     if total_pending > len(fresh):
         head += "，共 %d 条未处理" % total_pending
     lines = [head]
     for e in fresh[:PUSH_MAX_ITEMS]:
-        where = "私聊" if e.get("single") else "群"
         lines.append("")
+        if entry_kind(e) == KIND_ASK:
+            # ask 没有收件人也没有拟稿，写成「回 ?」会让他以为有条消息要发。
+            lines.append("[%s] 要你拿个主意" % e.get("id", ""))
+            if e.get("about_text"):
+                lines.append("  什么事：" + collapse(e["about_text"], PUSH_DRAFT_CHARS))
+            if e.get("suggest"):
+                lines.append("  我建议：" + collapse(e["suggest"], PUSH_ASK_CHARS))
+            continue
+        where = "私聊" if e.get("single") else "群"
         lines.append("[%s] 回 %s（%s）" % (e.get("id", ""),
                                           e.get("to_label") or "?", where))
         if e.get("about_text"):
@@ -823,8 +885,13 @@ def format_push(fresh, total_pending: int) -> str:
         lines.append("（还有 %d 条，`outbox list` 看全部）" % (len(fresh) - PUSH_MAX_ITEMS))
     lines.append("")
     # 一期还不能从手机发出去，说清楚，别让他在手机上白打字等回音。
-    lines.append("一期还不能从手机发，要发去电脑上处理；不要了回复不管用，"
-                 "用 `outbox drop <编号>`。")
+    if n_draft:
+        lines.append("一期还不能从手机发，要发去电脑上处理；不要了回复不管用，"
+                     "用 `outbox drop <编号>`。")
+    else:
+        # 全是 ask 时不要说「不能从手机发」—— 根本没有要发的东西，
+        # 那句话只会让他去找一条并不存在的待发消息。
+        lines.append("回一句你的判断就行；不用管的用 `outbox drop <编号>`。")
     return "\n".join(lines)
 
 
@@ -1124,8 +1191,9 @@ def push_outbox(cfg, at) -> dict:
     fresh = unnotified(entries)
     if not fresh:
         return {"ok": True, "skipped": "nothing_new",
-                "pending": len(pending_drafts(entries))}
-    body = format_push(fresh, len(pending_drafts(entries)))
+                "pending": len(pending_entries(entries))}
+    # 两种都数：`fresh` 里两种都有，只数草稿的话「共 N 条未处理」会小于新增条数。
+    body = format_push(fresh, len(pending_entries(entries)))
     res = send_reminder(cfg, body)
     if res.get("ok"):
         append_outbox(mark_notified([e["id"] for e in fresh], at))

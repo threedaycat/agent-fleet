@@ -338,12 +338,23 @@ def collect_collector() -> list[dict]:
                 if r.get("id"):
                     seen.setdefault(r["id"], {}).update(r)
         pend = [e for e in seen.values() if e.get("status") == "pending"]
-        quiet = [e for e in pend if not e.get("notified_at")]
-        # 「有草稿」本身不是问题，「有草稿而他还不知道」才是 —— 只对后者报警。
-        rows.append({"k": "待他拍板的草稿",
-                     "v": ("%d 条" % len(pend)) + (
-                         "（其中 %d 条还没推给他）" % len(quiet) if quiet else ""),
-                     "warn": bool(quiet)})
+        # 草稿和「等他拿主意」**分开数**。混在一起这行就是谎话 —— 他看到 5 条
+        # 会以为有 5 条待发消息，其实其中几条根本没有收件人。
+        try:
+            import dtwatch as _dt
+            kind = _dt.entry_kind
+        except Exception:
+            kind = lambda e: e.get("kind") or "draft"   # noqa: E731
+        for label, want in (("待他拍板的草稿", "draft"), ("等他拿主意", "ask")):
+            group = [e for e in pend if kind(e) == want]
+            if not group and want == "ask":
+                continue                       # 没有就不占一行
+            quiet = [e for e in group if not e.get("notified_at")]
+            # 「有草稿」本身不是问题，「有草稿而他还不知道」才是 —— 只对后者报警。
+            rows.append({"k": label,
+                         "v": ("%d 条" % len(group)) + (
+                             "（其中 %d 条还没推给他）" % len(quiet) if quiet else ""),
+                         "warn": bool(quiet)})
     q = os.path.join(BASE, "data", "desk_queue.ndjson")
     if os.path.isfile(q):
         with open(q, encoding="utf-8") as f:
