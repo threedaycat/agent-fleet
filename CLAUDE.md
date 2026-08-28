@@ -72,3 +72,15 @@
 python3 -m unittest discover -s tests      # 全套
 python3 tests/_audit_run.py                # 同一套 + 证明没碰 data/
 ```
+
+**⚠️ `rm -rf __pycache__` 在这台机器上没有用。** 系统 python3 设了
+`sys.pycache_prefix = ~/Library/Caches/com.apple.python`，字节码缓存**不在仓库里**：
+
+```sh
+rm -rf ~/Library/Caches/com.apple.python/Users/lsy/Zymix/agent-fleet
+```
+
+2026-08-28 被这个坑掉进去一次：把 `BASE` 改成 `HERE`（**两个词长度相同**，
+文件大小不变），缓存没失效，于是**源码显示 `HERE`、字节码里还是 `BASE`**，
+`NameError: name 'BASE' is not defined` 指着一行写着 `HERE` 的代码。
+查法：`func.__code__.co_names` 看字节码里真正的名字，别信源码。

@@ -127,6 +127,35 @@ class NoBlacklist(unittest.TestCase):
                 # 而记账认得出来
                 self.assertTrue(dw.is_self_echo(pre + "正文", ring((pre + "正文", AT)), AT))
 
+    def test_接线本身能跑通(self):
+        """**这条是补票，也是这批用例第一版全绿却没用的原因。**
+
+        2026-08-28 实测：单元测试 15 条全绿、变异体 9/9 全灭、真数据比对 4/4 正确，
+        但线上反馈环**照旧**。根因是 `dtcc.dtwatch_mod()` 里写了 `BASE`
+        （那是 dtwatch 的常量名，dtcc 这边叫 `HERE`），抛 NameError，
+        被调用处的 `except Exception: pass` 吞掉，表现成"每条都没匹配上"。
+
+        前面所有用例都直接调 `dtwatch.is_self_echo`，**一条都没走过那条接线**。
+        测了判据不等于测了功能——这是"在坏掉的状态下也会通过的验收标准"。
+        """
+        import dtcc
+        m = dtcc.dtwatch_mod()                      # 写错常量名这里就炸
+        self.assertTrue(hasattr(m, "is_self_echo"))
+        self.assertTrue(hasattr(m, "recent_self_sends"))
+        self.assertIs(m, dw, "dtcc 拿到的应该就是同一个 dtwatch 模块")
+
+    def test_接线断了要出声不能静默走老路(self):
+        """兜底可以「按老行为走」，但不许**无声**地走。
+
+        无声兜底把一个永远不会自愈的 NameError 伪装成了"没匹配上"。
+        """
+        import inspect, dtcc
+        src = inspect.getsource(dtcc.collect)
+        self.assertIn("logline", src.split("echo_check = None")[1][:600],
+                      "拿不到判据时必须记一条日志")
+        self.assertNotIn("except Exception:                              # noqa: BLE001\n            pass",
+                         src, "不许每条消息一个静默 except")
+
     def test_记账在发送出口而不是调用方(self):
         # 漏事形态：把记账写在每个调用 send_reminder 的地方，
         # 下一个调用方忘了写，那条通知就又变成指令了。

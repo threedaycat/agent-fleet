@@ -227,10 +227,20 @@ def collect(cfg, since: str, accept_bare: bool = True) -> tuple[list[dict], str]
     """
     state = load_json(STATE, {})
     consumed = set(state.get("consumed", []))
+    # 「自己推的通知」判据，循环外准备一次。
+    # **拿不到要出声。** 第一版这里是 `except Exception: self_sends = []` 加上
+    # 每条消息一个 `except: pass`，于是 dtwatch_mod 里的一个 NameError 被完全吞掉，
+    # 表现成"每条都没匹配上"——反馈环照旧，日志里一个字都没有，
+    # 而单元测试全绿（它们直接调 dtwatch.is_self_echo，从没走过这条接线）。
+    # 兜底仍然是「按老行为走」，但必须留下痕迹，否则它永远不会被发现。
+    echo_check = None
     try:
-        self_sends = dtwatch_mod().recent_self_sends()   # 循环外读一次，别每条都读盘
-    except Exception:                                    # noqa: BLE001
-        self_sends = []
+        _dw = dtwatch_mod()
+        _sends = _dw.recent_self_sends()                 # 循环外读一次，别每条都读盘
+        echo_check = lambda txt: _dw.is_self_echo(txt, _sends, now())
+    except Exception as e:                               # noqa: BLE001
+        logline(f"[push] ⚠️ 问不到「这条是不是自己推的」，本轮按老行为走"
+                f"（系统通知会被当成指令）：{type(e).__name__}: {e}")
     out = []
     newest = since
     for m in fetch(cfg, since):
@@ -246,13 +256,11 @@ def collect(cfg, since: str, accept_bare: bool = True) -> tuple[list[dict], str]
         # 按**记账**认（dtwatch.note_self_send 在发送出口记指纹），不按前缀名单认：
         # OUT_MARKERS 是黑名单，dtwatch 那边的【哨兵】/【时效】/【待你拍板】
         # 一个都不在里面，而且每加一种新通知就会再漏一次。
-        try:
-            dw = dtwatch_mod()
-            if dw.is_self_echo(t, self_sends, now()):
-                logline(f"[push] 自己的回声，不当指令 :: {t[:50]}")
-                continue
-        except Exception:                              # noqa: BLE001
-            pass      # 问不到就按老行为走（当指令），不因为这层挂掉而丢他的话
+        if echo_check is None:
+            pass                    # 这一轮问不成，已经在循环外报过一次
+        elif echo_check(t):
+            logline(f"[push] 自己的回声，不当指令 :: {t[:50]}")
+            continue
         prefixed, body = strip_prefix(t)
         q = quoted_of(m)
         # 引用了 CC 的播报 = 明确在跟我说话
@@ -762,8 +770,11 @@ def dtwatch_mod():
     两边互不 import（都懒加载 fleet），这里保持同一个形状，
     免得任何一边的模块级副作用被另一边拖进来。
     """
-    if BASE not in sys.path:
-        sys.path.insert(0, BASE)
+    # ⚠️ 这个模块里的根目录常量叫 HERE，不是 BASE —— BASE 是 dtwatch 那边的名字。
+    # 写错过一次（2026-08-28），NameError 被下面调用处的 except 吞掉，
+    # 表现成"没匹配上"，于是反馈环照旧，而日志里一个字都没有。
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
     import dtwatch
     return dtwatch
 
