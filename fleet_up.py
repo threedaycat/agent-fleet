@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -348,6 +349,178 @@ def cmd_up(args) -> int:
     print(f"\n完成：新建 {built} 个 session，跳过 {skipped} 个。")
     if built and not args.dry_run:
         print("Claude pane 需要几十秒启动并读完角色提示词，`fleet_up.py check` 可以对账。")
+    return 0
+
+
+# ---------------------------------------------------------------- heal
+#
+# 2026-08-28 用户原话：「desk 死掉了，你不应该让这个系统有一个维护状态吗？
+# 就是把死掉的拉起来？？」
+#
+# 需要这一层是因为 `cmd_up` **补不了 live session 里缺失的窗口** —— 它撞见
+# 已存在的 session 就整个跳过。所以 `remote` 那个 pane 一旦没了，再也不会被建起来。
+
+HEAL_COOLDOWN_MINUTES = 60
+HEAL_LOG = os.path.join(BASE, "data", "heal_log.ndjson")
+
+# ⚠️ **不是所有「不正常」都该拉起来。** 每种状态不修的理由不一样，
+# 而且都是「修了会更糟」，不是「懒得修」。
+HEAL_SKIP_WHY = {
+    "never": "pane 在，它不是死了是没活干（上下文 0k）。重启没用 —— "
+             "要么给它接上活，要么把角色声明删掉",
+    "stale": "pane 有上下文，重启 = 把上下文丢掉。那是破坏不是修复",
+    "unknown": "读不出，不知道该做什么。不猜",
+    "live": "正常",
+}
+
+
+def heal_plan(report: list[dict], at: float, last_try: dict | None = None,
+              cooldown_minutes: float = HEAL_COOLDOWN_MINUTES) -> list[dict]:
+    """哪些角色现在该修、怎么修。**纯函数。**
+
+    只有 `missing`（声明了但 pane 不存在）能修。冷却期是为了防「建不起来就
+    无限重试」—— 一个角色文件坏了的话，没有冷却会让它每分钟建一个失败的窗口。
+    """
+    out = []
+    for r in report:
+        role, state = r.get("role"), r.get("state")
+        if state != "missing":
+            out.append({"role": role, "action": "skip",
+                        "why": HEAL_SKIP_WHY.get(state, "未知状态，不动")})
+            continue
+        prev = (last_try or {}).get(role)
+        if prev is not None:
+            try:
+                gap = (at - float(prev)) / 60
+            except (TypeError, ValueError):
+                # 读不出上次尝试时间**不等于**没试过。当成刚试过，宁可晚一轮。
+                out.append({"role": role, "action": "skip",
+                            "why": f"上次尝试时间读不出（{prev!r}）"})
+                continue
+            if gap < cooldown_minutes:
+                out.append({"role": role, "action": "skip",
+                            "why": f"{gap:.0f} 分钟前刚试过，冷却 {cooldown_minutes:.0f} 分钟"})
+                continue
+        out.append({"role": role, "action": "build", "why": "pane 不存在，建一个"})
+    return out
+
+
+def role_window(cfg: dict, role: str):
+    """角色 → `(session 名, window 定义)`。找不到给 `(None, None)`。
+
+    ⚠️ **`role` falsy 时必须先返回。** 否则 `p.get("role") == None` 会匹配上
+    **任何没有 role 的 pane**（`{}.get("role")` 就是 `None`），heal 就会去建一个
+    跟这个角色毫无关系的窗口。（自己的用例抓出来的。）
+
+    只留这一道守卫，不在循环里再加 `p.get("role") and …` —— 两道各自都够，
+    变异测试就杀不掉任何一道（互相掩护），等于两道都没被验证过。
+    """
+    if not role:
+        return None, None
+    for s in cfg.get("sessions") or []:
+        for w in s.get("windows") or []:
+            for p in w.get("panes") or []:
+                if p.get("role") == role:
+                    return s["name"], w
+    return None, None
+
+
+def heal_attempts() -> dict:
+    """每个角色上次尝试重建的时间。append-only ndjson，后写覆盖先写。"""
+    out = {}
+    if not os.path.isfile(HEAL_LOG):
+        return out
+    with open(HEAL_LOG, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("role"):
+                out[r["role"]] = r.get("at")
+    return out
+
+
+def note_attempt(role: str, at: float, ok: bool, note: str = "") -> None:
+    os.makedirs(os.path.dirname(HEAL_LOG), exist_ok=True)
+    with open(HEAL_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"role": role, "at": at, "ok": bool(ok), "note": note},
+                           ensure_ascii=False) + "\n")
+
+
+def cmd_heal(args) -> int:
+    """把死掉的拉起来。**默认只报不做** —— 自愈动作有副作用，要人点头。"""
+    import time as _time
+
+    import console as _console          # 函数内导：console 顶层导 fleet_up，会成环
+    at = _time.time()
+    report = _console.role_report(_console.collect_panes(True),
+                                  _console.declared_roles(), at)
+    plan = heal_plan(report, at, heal_attempts(), args.cooldown)
+
+    build = [p for p in plan if p["action"] == "build"]
+    for p in plan:
+        mark = "→" if p["action"] == "build" else " "
+        print(f"  {mark} {p['role']:<8} {p['why']}")
+
+    # desk 队列：不是角色的事，但是同一类病 —— `desk_push.sh drain` 全仓零调用方，
+    # 所以排进队列的东西没人放出来。
+    q = os.path.join(BASE, "data", "desk_queue.ndjson")
+    stuck = 0
+    if os.path.isfile(q):
+        with open(q, encoding="utf-8") as f:
+            stuck = sum(1 for line in f if line.strip())
+    desk = next((r for r in report if r["role"] == "desk"), None)
+    can_drain = stuck and desk and desk["state"] == "live" and desk.get("pane")
+    if stuck:
+        print(f"  {'→' if can_drain else ' '} desk 队列  {stuck} 条排着"
+              + ("" if can_drain else "，但 desk 不是 live，不放"))
+
+    if not build and not can_drain:
+        print("\n没有可修的。")
+        return 0
+    if not args.apply:
+        print(f"\n[只报不做] 加 --apply 才真动手。")
+        return 0
+
+    cfg = load_cfg(args.config)
+    claude_bin = (cfg.get("defaults") or {}).get("claude_cmd", "claude")
+    done = 0
+    for p in build:
+        sess, w = role_window(cfg, p["role"])
+        if not sess:
+            print(f"  ✗ {p['role']}：配置里找不到它属于哪个窗口")
+            note_attempt(p["role"], at, False, "配置里没有")
+            continue
+        if not role_path(p["role"]):
+            print(f"  ✗ {p['role']}：角色文件缺失，不建半拉子窗口")
+            note_attempt(p["role"], at, False, "角色文件缺失")
+            continue
+        if not session_exists(sess):
+            print(f"  ✗ {p['role']}：session {sess} 不存在，这该走 up 不是 heal")
+            note_attempt(p["role"], at, False, f"session {sess} 不在")
+            continue
+        try:
+            # first=False：往**已存在**的 session 里加窗口，不碰别的窗口。
+            build_window(sess, w, first=False, claude_bin=claude_bin, dry=False)
+            print(f"  ✓ {p['role']}：已在 {sess} 建好")
+            note_attempt(p["role"], at, True, "")
+            done += 1
+        except Exception as e:
+            print(f"  ✗ {p['role']}：{type(e).__name__}: {e}")
+            note_attempt(p["role"], at, False, f"{type(e).__name__}: {e}")
+
+    if can_drain:
+        rc = subprocess.run([os.path.join(BASE, "desk_push.sh"), "drain", desk["pane"]],
+                            capture_output=True, text=True)
+        print(f"  {'✓' if rc.returncode == 0 else '✗'} desk 队列："
+              f"{(rc.stdout or rc.stderr).strip()}")
+
+    print(f"\n修好 {done} 个。Claude pane 要几十秒才读完角色提示词，"
+          f"隔一会儿再跑 doctor 对账。")
     return 0
 
 
@@ -1226,6 +1399,13 @@ def main() -> int:
     k = sub.add_parser("check", help="yaml 与现实对账")
     k.add_argument("--config", "-c", help="指定配置文件")
     k.set_defaults(func=cmd_check)
+
+    hl = sub.add_parser("heal", help="把死掉的角色拉起来（默认只报不做）")
+    hl.add_argument("--apply", action="store_true", help="真动手")
+    hl.add_argument("--config", "-c", help="指定配置文件")
+    hl.add_argument("--cooldown", type=float, default=HEAL_COOLDOWN_MINUTES,
+                    help=f"同一个角色多久内不重试（默认 {HEAL_COOLDOWN_MINUTES} 分钟）")
+    hl.set_defaults(func=cmd_heal)
 
     d = sub.add_parser("doctor", help="开机自检")
     d.set_defaults(func=cmd_doctor)
