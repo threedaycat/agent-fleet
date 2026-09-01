@@ -11,9 +11,10 @@ picker 那边是通用可分享的 MIT 仓库，**它不知道这些条目是什
     picker_items.py action  <id>    回车动作
 
 数据全部走 fleet.py 现成的函数，不自己重算一套：
-    at_me_open()   要他回的消息（已经带全文和图片下载命令）
     inbox_stats()  待投递队列、积压
     sessions()     心跳/pane/状态
+    at_me_open()   要他回的消息 —— **只在 preview/action 用**，
+                   list 里已经撤掉了，理由见 cmd_list 的注释
 """
 import os
 import sys
@@ -171,34 +172,31 @@ def system_lines() -> list[str]:
 
 
 def cmd_list() -> int:
+    """picker 的第一需求是**切 Claude**，附加条目只配当配角。
+
+    所以这里只放「跟某个会话有关、且要他动手」的东西：卡住的、有队列没消费的。
+    @我的钉钉消息**不进 picker**（2026-09-01 撤掉）—— 它只有两条关闭路径
+    （`dtwatch.py --status done`、在钉钉上给那条贴表情，见 dtwatch.sweep_acks），
+    日常刷过去的两条都不走，于是 7 月底的还挂在「未处理」里，实测 396 条。
+    那不是待办，是一条只进不出的流水；而且 picker 侧本来就会把它折叠掉，
+    等于花 ~1 秒扫 20MB 的 inbox.ndjson 算出一堆看不见的行。
+    要看积压走 `fleet.py atme`，数据一条没删。
+    """
     live = fleet.sessions()
     backlog = session_backlog()
-    atme = atme_items()
     stuck = stuck_sessions(live, backlog)
     queues = [(sid, n) for sid, n in backlog.items()
               if not any(sid == s for s, *_ in stuck)]
     queues.sort(key=lambda x: -x[1])
 
-    total = len(atme) + len(stuck) + len(queues)
+    total = len(stuck) + len(queues)
     # 「待办」区没事就整个不出现；「系统」区**永远出现** ——
     # 「现在没事」正是最该能一眼确认系统本身还活着的时候。
     if not total:
         print("\n".join(system_lines()))
         return 0
 
-    # 系统区排在**最前面**：实测「待办」区有 396 条（@我的积压全量倒进来），
-    # 系统状态放后面就落在第 397 行 —— 等于看不见。它只占两行，值得占最上面。
     lines = list(system_lines()) + [header(f"{RED}▾ 待办 · {total}{OFF}")]
-
-    for r in atme:
-        text, _ = fleet.split_media(r.get("text") or "")
-        text = fleet.strip_ats(text)
-        where = "私聊" if r.get("single") else (r.get("conv") or "")
-        lines.append(row(
-            f"  {RED}[@]{OFF} {(r.get('time') or '')[5:16]}  "
-            f"{col(r.get('sender') or '?', 12)}  "
-            f"{DIM}{col(where, 16)}{OFF}  {clip(text, 42)}",
-            f"atme:{r['id']}"))
 
     for sid, rec, age, n in stuck:
         lines.append(row(
