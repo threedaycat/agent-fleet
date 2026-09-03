@@ -137,6 +137,90 @@ def stuck_sessions(live: dict, backlog: dict) -> list:
     return out
 
 
+def split_queues(live: dict, backlog: dict, taken=(), label=None) -> tuple[list, list]:
+    """待投递队列拆成「还能跳过去的」和「孤儿」。**纯函数。**
+
+    孤儿 = 这个 sid 已经不在 `fleet.sessions()` 里，**给不出舰队坐标**。
+    以前它照样列出来，标签退化成 `sid[:8]` —— 那既违反 `fleet.disp_of` 写死的
+    「不露 session_id 碎片」，也是一行**跳无可跳**的死行：按回车只会得到
+    「这个会话已经不在了」。2026-09-03 实测两行孤儿(7ac581c7 / 11f9b87a)
+    分别压着 439 和 186 条，而那两个会话最后一次写盘是 8-05 和 8-07。
+
+    所以列表里不给它们位置，但**不能就这么消失**：625 条投不出去的消息是真问题，
+    只是不属于「待办」。它们从第二个返回值走「系统」区，见 `system_lines`。
+    """
+    label = label or (lambda rec: fleet.disp_of(rec, short=True))
+    taken = set(taken)
+    ok, orphan = [], []
+    for sid, n in (backlog or {}).items():
+        if not n or sid in taken:
+            continue
+        # 判据是**叫不叫得出名字**，不是「记录在不在」。
+        # 第一版写的 `(live or {}).get(sid)`，被自己的用例打了：`{}` 是 falsy，
+        # 一个存在但记录为空的会话会被判成孤儿；反过来，记录在、但 disp_of
+        # 给不出坐标的，照样会渲染成一行空白标签。两种都是错的。
+        rec = (live or {}).get(sid)
+        (ok if rec is not None and label(rec) else orphan).append((sid, n))
+    ok.sort(key=lambda x: -x[1])
+    orphan.sort(key=lambda x: -x[1])
+    return ok, orphan
+
+
+def role_coords(decl: dict) -> set:
+    """声明键 `sess:win#idx` → 运行期坐标 `sess:win.idx`。
+
+    跟 `console.role_report` 里那一行是同一个换算。那边是为了查表，这边是为了
+    **只给这几个 pane 抓上下文** —— 全部 31 个 pane 抓一遍 0.13s，
+    只抓声明出来的 3 个是 0.01s，而 `list` 有 2 秒死线(超了会把附加条目整片丢掉)。
+    """
+    out = set()
+    for key in (decl or {}):
+        sess, _, rest = key.partition(":")
+        win, _, idx = rest.partition("#")
+        if sess and win and idx:
+            out.add(f"{sess}:{win}.{idx}")
+    return out
+
+
+def heal_why() -> dict:
+    """「这个状态该不该重启」的说明，**从 fleet_up 借**，不在这儿再写一份。
+    借不到就给空字典 —— 少一行说明，好过两处说法不一致。"""
+    try:
+        import fleet_up
+        return dict(getattr(fleet_up, "HEAL_SKIP_WHY", {}) or {})
+    except Exception:                                   # noqa: BLE001
+        return {}
+
+
+def session_file(sid: str):
+    """那个会话的 transcript 路径，找不到给 None。
+
+    只用来回答「它最后一次写盘是什么时候」——判断一个孤儿队列是昨天掉的
+    还是一个月前掉的，这两件事的处理方式完全不同。
+    """
+    root = os.path.expanduser("~/.claude/projects")
+    try:
+        for d in os.listdir(root):
+            f = os.path.join(root, d, f"{sid}.jsonl")
+            if os.path.exists(f):
+                return f
+    except OSError:
+        pass
+    return None
+
+
+def role_alerts(report: list) -> list:
+    """只留「要他看一眼」的角色。**纯函数。**
+
+    `live` 不出现——正常的东西不该占位置。
+    `unknown` 也不出现：读不出**不是结论**，把它排进待办会让他去修一个
+    可能根本不存在的问题。要看全量(含 unknown)按回车进 dash。
+    """
+    order = {"missing": 0, "never": 1, "stale": 2}
+    return sorted((r for r in (report or []) if r.get("state") in order),
+                  key=lambda r: (order[r["state"]], r.get("role") or ""))
+
+
 # ---------------------------------------------------------------- list
 
 def console_mod():
@@ -148,14 +232,41 @@ def console_mod():
     return console
 
 
-def system_lines() -> list[str]:
-    """「系统状态」区。
+ROLE_MARK = {"missing": (RED, "[✗]"), "never": (YEL, "[○]"), "stale": (YEL, "[!]")}
+
+
+def collect_role_report(at: float) -> list:
+    """采角色现状。**只做 IO**，判据全在 `console.role_state`，不在这儿复制一份。
+
+    只给**声明出来的**那几个 pane 抓上下文。全部 31 个 pane 抓一遍实测 0.134s，
+    3 个只要 0.01s —— 差别本身不大，但 `list` 有 2 秒死线且超时会把**整片**
+    附加条目丢掉，所以能省的就省。
+
+    上下文必须抓：不抓的话 `role_state` 一律给 `unknown`（读不出≠没干活，
+    那个函数拒绝猜），整个角色区就全是问号，等于没有。
+    """
+    c = console_mod()
+    panes = c.collect_panes(with_ctx=False)
+    decl = c.declared_roles()
+    want = role_coords(decl)
+    for p in panes:
+        if p.get("coord") in want:
+            try:
+                p["ctx"] = fleet.ctx_usage(p.get("pane"))
+            except Exception:                           # noqa: BLE001
+                p["ctx"] = None                         # 读不出就是 None，别拿 0 冒充
+    return c.role_report(panes, decl, at)
+
+
+def system_lines(orphans=(), alerts=()) -> list[str]:
+    """「系统状态」区 —— 舰队自己的健康,不是待办。
 
     ⚠️ **这里只允许放便宜的判据。** picker 侧给 `list` 的死线是
     `CLAUDE_TMUX_EXTRA_TIMEOUT`（默认 2 秒），超时 `run_with_deadline` 会把
-    **全部**附加条目一起丢掉 —— 不只是这一条。实测 `list` 本身已经用掉
-    0.5–0.8 秒，而每个 pane 抓一次屏要 0.23 秒。所以角色和上下文（都要抓屏）
-    留给 `preview`，它是选中才跑、没有死线。
+    **全部**附加条目一起丢掉 —— 不只是这一条。
+    2026-09-03 重测：`list` 基线 0.23s（原注释写的 0.5–0.8s 是撤掉 @我 扫描之前的数），
+    加上只给声明角色抓上下文约 +0.02s。原注释说「每个 pane 抓屏 0.23 秒」也是错的，
+    实测 31 个 pane 全抓共 0.134s。**数字重测过才敢往里加东西。**
     """
     try:
         c = console_mod()
@@ -165,10 +276,27 @@ def system_lines() -> list[str]:
         bad = ok_c != len(checks) or ok_s != len(svcs)
         mark = f"{YEL}[*]{OFF}" if bad else f"{DIM}[*]{OFF}"
         body = f"自检 {ok_c}/{len(checks)}   服务 {ok_s}/{len(svcs)}"
-    except Exception as e:
+    except Exception as e:                              # noqa: BLE001
         mark, body = f"{RED}[*]{OFF}", f"读不出（{type(e).__name__}: {e}）"
-    return [header(f"{DIM}▾ 系统{OFF}"),
-            row(f"  {mark} {col('系统状态', 22)}  {DIM}{body}{OFF}", "system:dash")]
+
+    lines = [header(f"{DIM}▾ 系统{OFF}"),
+             row(f"  {mark} {col('系统状态', 22)}  {DIM}{body}{OFF}", "system:dash")]
+
+    for a in alerts:
+        tone, glyph = ROLE_MARK.get(a.get("state"), (DIM, "[?]"))
+        # 坐标优先 —— 声明了却没 pane 的角色根本没有坐标，那时才退回角色名。
+        who = a.get("coord") or f"{a.get('role')}（没有 pane）"
+        lines.append(row(
+            f"  {tone}{glyph}{OFF} {col(who, 22)}  "
+            f"{DIM}{a.get('role')} {clip(a.get('note') or '', 34)}{OFF}",
+            f"role:{a.get('role')}"))
+
+    if orphans:
+        n = sum(x[1] for x in orphans)
+        lines.append(row(
+            f"  {YEL}[Q]{OFF} {col('孤儿队列', 22)}  "
+            f"{DIM}{len(orphans)} 个会话 · {n} 条投不出去{OFF}", "orphans"))
+    return lines
 
 
 def cmd_list() -> int:
@@ -185,18 +313,23 @@ def cmd_list() -> int:
     live = fleet.sessions()
     backlog = session_backlog()
     stuck = stuck_sessions(live, backlog)
-    queues = [(sid, n) for sid, n in backlog.items()
-              if not any(sid == s for s, *_ in stuck)]
-    queues.sort(key=lambda x: -x[1])
+    queues, orphans = split_queues(live, backlog, taken=[s for s, *_ in stuck])
+
+    # 角色采不到就当没有 —— 不能让「舰队体检读不出」把整个 picker 拖没了。
+    try:
+        alerts = role_alerts(collect_role_report(time.time()))
+    except Exception:                                   # noqa: BLE001
+        alerts = []
 
     total = len(stuck) + len(queues)
+    sysx = system_lines(orphans=orphans, alerts=alerts)
     # 「待办」区没事就整个不出现；「系统」区**永远出现** ——
     # 「现在没事」正是最该能一眼确认系统本身还活着的时候。
     if not total:
-        print("\n".join(system_lines()))
+        print("\n".join(sysx))
         return 0
 
-    lines = list(system_lines()) + [header(f"{RED}▾ 待办 · {total}{OFF}")]
+    lines = list(sysx) + [header(f"{RED}▾ 待办 · {total}{OFF}")]
 
     for sid, rec, age, n in stuck:
         lines.append(row(
@@ -205,10 +338,11 @@ def cmd_list() -> int:
             f"stuck:{sid}"))
 
     for sid, n in queues:
-        rec = live.get(sid) or {}
-        who = fleet.disp_of(rec, short=True) if rec else sid[:8]
+        # rec 一定在（split_queues 已经把没坐标的挑走了），所以这里不需要
+        # `else sid[:8]` 那个退路 —— 那个退路正是「会话显示」的来源。
         lines.append(row(
-            f"  {DIM}[Q]{OFF} {col(who, 22)}  {DIM}{n} 条待投递{OFF}",
+            f"  {DIM}[Q]{OFF} {col(fleet.disp_of(live[sid], short=True), 22)}  "
+            f"{DIM}{n} 条待投递{OFF}",
             f"queue:{sid}"))
 
     print("\n".join(lines))
@@ -236,6 +370,45 @@ def cmd_preview(item_id: str) -> int:
                 print(dash.paint(text, tone, color=True))
         except Exception as e:
             print(f"{RED}系统状态读不出{OFF}：{type(e).__name__}: {e}")
+        return 0
+
+    if kind == "role":
+        try:
+            rep = collect_role_report(time.time())
+        except Exception as e:                          # noqa: BLE001
+            print(f"{RED}角色读不出{OFF}：{type(e).__name__}: {e}")
+            return 0
+        cur = [r for r in rep if r.get("role") == key]
+        if not cur:
+            print("（这个角色的声明已经不在了）")
+            return 0
+        for r in cur:
+            print(f"{r.get('role')}  {r.get('coord') or '(没有 pane)'}   {r.get('state')}")
+            print(f"{DIM}{r.get('note') or ''}{OFF}")
+        print(f"{DIM}{'─' * 46}{OFF}")
+        print(heal_why().get(cur[0].get("state"), ""))
+        pane = cur[0].get("pane")
+        if pane and fleet.pane_alive(pane):
+            print(f"\n{DIM}—— 它的画面 ——{OFF}")
+            print(fleet.pane_tail(pane, lines=20) or "(空)")
+        print(f"\n{DIM}回车 = 跑一次 heal 的 dry-run（只报不做）{OFF}")
+        return 0
+
+    if item_id == "orphans":
+        live, backlog = fleet.sessions(), session_backlog()
+        _, orphans = split_queues(live, backlog)
+        if not orphans:
+            print("（没有孤儿队列了）")
+            return 0
+        print("这些会话已经不在编队里，给不出坐标，所以不进「待办」——")
+        print("但它们名下的消息**投不出去**，不是 0 条。")
+        print(f"{DIM}{'─' * 46}{OFF}")
+        for sid, n in orphans:
+            f = session_file(sid)
+            when = time.strftime("%Y-%m-%d", time.localtime(os.path.getmtime(f))) \
+                if f else "查不到会话文件"
+            print(f"  {sid[:8]}  {col(str(n) + ' 条', 8)}  最后写盘 {when}")
+        print(f"\n{DIM}回车 = 打印它们的完整 sid，好让你自己决定怎么处理{OFF}")
         return 0
 
     if kind == "atme":
@@ -327,6 +500,25 @@ def cmd_action(item_id: str) -> int:
               ["-n", "dash", f"{sys.executable} {os.path.join(HERE, 'dash.py')}"]
         rc, out = fleet.sh(cmd)
         print("已开一个 dash 窗口" if rc == 0 else f"开窗失败：{out}")
+        return 0
+
+    if kind == "role":
+        # **只跑 dry-run。** heal --apply 会建 pane、发消息，那是有副作用的动作，
+        # 不能挂在一个「按回车看看」的键上。
+        rc, out = fleet.sh([sys.executable, os.path.join(HERE, "fleet_up.py"), "heal"],
+                           timeout=30)
+        print(out or f"(heal 没有输出，退出码 {rc})")
+        print(f"\n{DIM}要真动手：python3 {os.path.join(HERE, 'fleet_up.py')} heal --apply{OFF}")
+        return 0
+
+    if item_id == "orphans":
+        live, backlog = fleet.sessions(), session_backlog()
+        _, orphans = split_queues(live, backlog)
+        if not orphans:
+            print("（没有孤儿队列了）")
+            return 0
+        for sid, n in orphans:
+            print(f"{sid}\t{n}")
         return 0
 
     if kind == "atme":
