@@ -188,6 +188,208 @@ SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 # 五种角色状态各给一个不同记号。`never` 和 `unknown` 故意不共用 ——
 # 「从没干过活」是结论，「读不出」是没有结论，屏幕上必须能分开。
 ROLE_MARK = {"missing": "✗", "never": "○", "stale": "◐", "unknown": "?", "live": "●"}
+
+# 舰队编组：一个 tmux session 画一个框，框里是它的成员 pane。
+# 组数和成员数都**不设上限**（2026-09-03 他明确要「开放，都画出来」）。
+# 省略只在宽度真的放不下一个框时才发生，而那时也要报数。
+GROUP_MAX = None             # None = 全画
+GROUP_ROWS = None            # None = 全列
+GROUP_BAR = 8                # 框里的条比外面窄，给坐标让位
+BOX_MIN = 34                 # 一个框最少要这么宽才装得下一行成员：
+                             # 边框2 + 记号1 + 空1 + 角色6 + 空1 + 坐标6 + 空1
+                             #        + 条8 + 空1 + 数字5 ≈ 32，留 2 余量
+BOX_GAP = 2                  # 框与框之间的空隙
+MEMBER_MARK = {"running": "▶", "never": "○", "unknown": "?", "idle": "·"}
+
+
+def member_mark(p: dict) -> str:
+    """成员那一列的记号。
+
+    **`unknown` 和 `never` 必须分得开**（跟 `console.role_state` 同一条规矩）：
+    上下文读不出是「没有结论」，0k 是「有结论、结论是从没干过活」。
+    把前者画成后者就是编造。
+    """
+    if (p.get("status") or "") == "running":
+        return MEMBER_MARK["running"]
+    kb, _ = parse_ctx(p.get("ctx"))
+    if kb is None:
+        return MEMBER_MARK["unknown"]
+    if kb == 0:
+        return MEMBER_MARK["never"]
+    return MEMBER_MARK["idle"]
+
+
+def _kb(p: dict) -> int:
+    kb, _ = parse_ctx(p.get("ctx"))
+    return kb or 0
+
+
+def group_panes(panes: list, cap=GROUP_MAX, rows=GROUP_ROWS) -> tuple[list, int, int]:
+    """按 tmux session 编组。**纯函数** → `(组, 被省掉的组数, 被省掉的成员数)`。
+
+    组间排序：**有声明角色的排最前**（那是舰队正式编制，不是随手开的窗口），
+    其次是有正在跑的，再次按上下文总量。组内同理。
+
+    省略必须报数。一个框列 5 个而实际有 10 个，却不说，
+    读的人会以为那就是全部 —— 那跟把 625 条投不出去的消息说成 0 条是一个错。
+    """
+    buckets: dict = {}
+    for p in panes or []:
+        buckets.setdefault(p.get("session") or "?", []).append(p)
+
+    def prank(p):
+        return (0 if p.get("role") else 1,
+                0 if (p.get("status") or "") == "running" else 1,
+                -_kb(p), p.get("coord") or "")
+
+    def grank(kv):
+        name, ms = kv
+        return (0 if any(m.get("role") for m in ms) else 1,
+                0 if any((m.get("status") or "") == "running" for m in ms) else 1,
+                -sum(_kb(m) for m in ms), name)
+
+    ordered = sorted(buckets.items(), key=grank)
+    # cap/rows 为 None = 不限。用 len() 代替 None 做切片上界，
+    # 这样下面「被省掉几个」的算式对两种情况都成立，不用分支。
+    cap = len(ordered) if cap is None else cap
+    out, lost_m = [], 0
+    for name, ms in ordered[:cap]:
+        ms = sorted(ms, key=prank)
+        keep = len(ms) if rows is None else rows
+        # 统计一律**按全组算**，不按画出来的几行算。
+        # 第一版拿截断后的列表数「干过活」，10 个 pane 的组只画 5 行就报「5 干过活」，
+        # 读的人会以为剩下 5 个都是死的 —— 那是编造出来的结论。
+        stat = {"total": len(ms),
+                "live": sum(1 for m in ms if _kb(m) > 0),
+                "run": sum(1 for m in ms if (m.get("status") or "") == "running"),
+                "hot": sum(1 for m in ms if needs_compact(m))}
+        lost_m += max(0, len(ms) - keep)
+        out.append((name, ms[:keep], stat))
+    lost_g = max(0, len(ordered) - cap)
+    lost_m += sum(len(ms) for _, ms in ordered[cap:])
+    return out, lost_g, lost_m
+
+
+def fit_columns(width: int, box_min: int = BOX_MIN, gap: int = BOX_GAP) -> int:
+    """这个宽度一行能并排放几个框。**纯函数。**
+
+    至少 1 —— 窄到放不下一个框时也得画一个（挤一点好过整节消失）。
+    """
+    if width < box_min:
+        return 1
+    return max(1, (width + gap) // (box_min + gap))
+
+
+def col_width(width: int, cols: int, gap: int = BOX_GAP) -> int:
+    """并排 `cols` 个框时每个框多宽。余数留在右边不摊，摊了各框宽度不齐、列对不上。"""
+    cols = max(1, cols)
+    return max(BOX_MIN, (width - gap * (cols - 1)) // cols)
+
+
+def right_fit(stat: dict, avail: int) -> str:
+    """框右上角的统计，按剩余宽度降级。**信息优先级：总数 > 干过活 > 在跑。**
+
+    降到放不下就给空串 —— 让 `box_lines` 把整段丢掉，也比截成
+    「6 干过」这种半句话好。
+    """
+    run, hot = stat.get("run") or 0, stat.get("hot") or 0
+    # 「该压」放在最前面参与降级：框窄到放不下逐行提示时，
+    # 这个数字就是唯一还看得见的「有人该压了」，不能跟着一起没。
+    h_long = f" · {hot} 该压" if hot else ""
+    h_short = f" · {hot}压" if hot else ""
+    forms = [f"{stat['total']} pane · {stat['live']} 干过活"
+             + (f" · {run} 跑" if run else "") + h_long,
+             f"{stat['total']}p · {stat['live']}活"
+             + (f" · {run}▶" if run else "") + h_short,
+             f"{stat['total']}/{stat['live']}" + h_short,
+             f"{stat['total']}" + (f"·{hot}压" if hot else "")]
+    for f in forms:
+        if display_width(f) + 2 <= avail:
+            return f
+    return ""
+
+
+def pack(items: list, per_row: int) -> list:
+    """切成每行 `per_row` 个。**纯函数。**"""
+    per_row = max(1, per_row)
+    return [items[i:i + per_row] for i in range(0, len(items), per_row)]
+
+
+def box_lines(title: str, right: str, body: list, width: int) -> list:
+    """画一个框。**纯函数**，只吐字符串，不知道颜色也不知道终端。
+
+    `width` 是整个框占的列数（含两条竖边）。标题和右上角的统计压进上边框里，
+    压不下就先砍右边的统计 —— 标题是「这是谁」，比数字重要。
+    """
+    width = max(12, width)
+    inner = width - 2
+    head = f" {title} "
+    tail = f" {right} " if right else ""
+    if display_width(head) + display_width(tail) > inner:
+        tail = ""
+    if display_width(head) > inner:
+        head = " " + clip(title, inner - 2) + " "
+    fill = inner - display_width(head) - display_width(tail)
+    out = ["┌" + head + "─" * max(0, fill) + tail + "┐"]
+    for b in body:
+        out.append("│" + pad(clip(b, inner), inner) + "│")
+    out.append("└" + "─" * inner + "┘")
+    return out
+
+
+COMPACT_HINT = "该压了"
+COMPACT_MARK = "!"           # 框窄到放不下「该压了」时，退到记号列的一个字
+MIN_COORD = 8                # 坐标列再窄就认不出是哪个窗口了，宁可砍提示
+MEMBER_FIXED = 24            # 成员行除坐标外的固定开销，见 member_line 的注释
+
+
+def tail_for(width: int, any_hot: bool) -> int:
+    """成员行给「该压了」留几列。**纯函数。**
+
+    留不下就返回 0 —— 那时 `member_line` 把提示压到记号列（`!`），
+    框头的 `· N 该压` 也还在。**三种宽度下都还看得见「有人该压了」，
+    只是形状不同。** 2026-09-03 第一版没做这个判断，`该压了` 在 37 宽的框里
+    被截成「该…」，等于又把提示弄丢了一次。
+    """
+    if not any_hot:
+        return 0
+    full = 2 + display_width(COMPACT_HINT)
+    return full if width - MEMBER_FIXED - full >= MIN_COORD else 0
+
+
+def needs_compact(p: dict) -> bool:
+    """够不够得上「该压了」。读不出的一律不报 —— 没有结论就不催人干活。"""
+    kb, _ = parse_ctx(p.get("ctx"))
+    return kb is not None and kb >= COMPACT_KB
+
+
+def member_line(p: dict, width: int, tail_w: int = 0) -> str:
+    """框里的一行成员。坐标去掉 session 前缀 —— 那已经写在框的标题上了。
+
+    `tail_w` 是「该压了」那一列预留的宽度，**由调用方按整个框统一算**：
+    框里只要有一个 pane 超线，这一框每行都留这么宽，框内的列才对得齐。
+    留 0 就是这框里没人超线，一列都不浪费。
+    """
+    coord = p.get("coord") or "?"
+    short = coord.split(":", 1)[1] if ":" in coord else coord
+    kb, pct = parse_ctx(p.get("ctx"))
+    num = "   — " if kb is None else f"{kb:>4}k"
+    role = p.get("role") or ""
+    # 固定列：记号1 + 空1 + 角色6 + 空1 + …坐标… + 空1 + 条8 + 空1 + 数字5 = 24
+    cw = max(6, width - MEMBER_FIXED - tail_w)
+    hot = needs_compact(p)
+    tail = ""
+    if tail_w:
+        # 前导空格必须在字符串里，不能靠 pad —— pad 是左对齐补右边，
+        # 那样会渲染成「442k该压了」，数字和提示黏在一起。
+        tail = pad(("  " + COMPACT_HINT) if hot else "", tail_w)
+    # 没给提示留位置时，把它压进记号列。`▶`（正在跑）优先 —— 一个正在跑的
+    # 会话你现在也压不了它，先知道它在跑更有用。
+    mark = member_mark(p)
+    if hot and not tail_w and mark == MEMBER_MARK["idle"]:
+        mark = COMPACT_MARK
+    return (f"{mark} {pad(clip(role, 6), 6)} "
+            f"{pad(clip(short, cw), cw)} {bar(pct, GROUP_BAR)} {num}{tail}")
 ROLE_TONE = {"missing": "bad", "never": "bad", "stale": "warn",
              "unknown": "mute", "live": "ok"}
 
@@ -258,26 +460,37 @@ def compose(snap: dict, width: int, frame: int = 0, eased=None) -> list[tuple]:
                     f"{pad(clip(r['coord'] or '—', 20), 20)} {r['note']}",
                 ROLE_TONE.get(r["state"], "warn"))
 
-    # ---- 会话上下文
+    # ---- 舰队：一个 tmux session 一个框，框里是它的成员
     panes = snap.get("panes")
     if panes is None:
-        row("会话", "读不出", "bad")
+        row("舰队", "读不出", "bad")
     else:
-        rows, hidden = ctx_rows(panes)
-        if not rows:
-            row("会话", "没有 Claude pane", "mute")
-        for i, p in enumerate(rows):
-            kb, pct = parse_ctx(p.get("ctx"))
-            shown = eased.get(p.get("pane"))
-            num = "  —  " if kb is None else f"{kb:>4}k"
-            tone = "warn" if (kb is not None and kb >= COMPACT_KB) else ""
-            tail = "  该压了" if tone == "warn" else ""
-            # 坐标必须先 clip 再 pad —— 只 pad 的话超宽的坐标会把后面整列推歪
-            body = (f"{pad(clip(p['coord'], COORD_W), COORD_W)} "
-                    f"{bar(pct if shown is None else shown)} {num}{tail}")
-            row("会话" if i == 0 else "", body, tone)
-        if hidden:
-            row("", f"另有 {hidden} 个 pane 未显示（按占用取前 {CTX_ROWS} 个）", "mute")
+        groups, lost_g, lost_m = group_panes(panes)
+        if not groups:
+            row("舰队", "没有 Claude pane", "mute")
+        grid = inner - 2                                 # 网格总宽，跟分隔线对齐
+        cols = fit_columns(grid)
+        bw = col_width(grid, cols)
+        for chunk in pack(groups, cols):
+            # 同一行里所有框拉到一样高：上边框、成员、下边框才逐行对得齐。
+            # 只在底部补空行会让下边框错位，看着就是没做完。
+            h = max(len(ms) for _, ms, _ in chunk)
+            drawn = []
+            for name, ms, stat in chunk:
+                tw = tail_for(bw - 4, any(needs_compact(m) for m in ms))
+                body = [member_line(m, bw - 4, tw) for m in ms]
+                body += [""] * (h - len(ms))
+                drawn.append(box_lines(name, right_fit(stat, bw - display_width(name) - 4),
+                                       body, bw))
+            sep = " " * BOX_GAP
+            for i in range(h + 2):
+                # tone 按整行给。成员行里几个框状态各不相同，**给谁的颜色都是撒谎**，
+                # 所以一律中性 —— 状态全写在字面上（▶ 在跑 / ○ 从没干过活 /
+                # ? 读不出 / 该压了），不靠颜色传达。
+                tone = "accent" if i == 0 else ("mute" if i == h + 1 else "")
+                L.append(("  " + sep.join(d[i] for d in drawn), tone))
+        if lost_g or lost_m:
+            row("", f"另有 {lost_g} 个小组 · {lost_m} 个 pane 未画", "mute")
 
     L.append(("  " + "─" * (inner - 2), "mute"))
     spin = SPIN[frame % len(SPIN)]
