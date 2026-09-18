@@ -1160,6 +1160,24 @@ def wait_for_command(cfg, timeout: int, accept_bare: bool,
         cmds, newest = collect(cfg, since, accept_bare)
         real, held = [], []
         for c in cmds:
+            # 我们自己推到自聊天的通知被读回来了 —— 任何会话都不该把它当指令。
+            # **这一条必须排在最前**：它不是"归不归我"的问题，是"这压根不是指令"。
+            #
+            # 2026-09-18 赔出来的：`collect()` 早就把 `self_echo` 算好了
+            # （见那个函数里 08-28 那段注释），但**只有 `push_once` 读它**。
+            # 这个函数遍历的是同一份 `collect()` 输出，却只判了 note_only /
+            # is_meta / entitled / claim —— 一行没碰 self_echo。两边跑在同一个
+            # 轮询窗口里，谁先 claim 谁赢：那天 17:42:15 push-loop 正确地
+            # 「消费掉不派活」，17:42:16 某个会话的 Stop hook 手上已经有同一条了，
+            # 于是把一条 dtwatch 自己推的【哨兵】摘要当成他手机发来的指令注了进去。
+            # 同形状在 09-16 10:09、09-17 16:34 各发生过一次，从没报错。
+            #
+            # 照抄下面「便签」那条的形状：claim 到就消费掉，让游标能过去。
+            if c.get("self_echo"):
+                if claim(c["id"], sid):
+                    consume([c["id"]])
+                    logline(f"[route] 自己的回声，不当指令 :: {c['text'][:60]}")
+                continue
             # 便签只该被 push-loop 贴个表情然后归档，任何会话都不该把它当活捡走。
             # push-loop 常驻在跑，正常情况轮不到这里；这是兜底。
             if c.get("note_only"):
