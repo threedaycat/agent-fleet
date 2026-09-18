@@ -196,3 +196,76 @@ class NoBlacklist(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WaitForCommandDropsEcho(unittest.TestCase):
+    """**Stop hook 那条路也必须滤回声 —— 09-18 补的票。**
+
+    上面 `test_回声要被消费掉不能只跳过` 钉的是 `push_once`，而 Stop hook
+    走的根本不是它，是 `wait_for_command`。两个函数遍历的是同一份
+    `collect()` 输出，可当时只有前者读 `self_echo`。于是：
+
+        17:42:15 [push]  自己的回声，消费掉不派活 :: 【哨兵】…#997
+        17:42:16 [route] take(owner-pane-gone(5380)) sid=e1e3 :: 【哨兵】…#997
+        17:42:16 [hook-stop] inject: 【哨兵】…#997
+
+    防线在一条路上生效、在另一条路上根本不存在，而且**不报错**。
+    同形状 09-16 10:09、09-17 16:34 各来过一次。
+
+    这一批是**行为**测试，不是读源码：判据对不对不重要，重要的是这个函数
+    真拿到一条带 self_echo 的记录时到底返不返回它。
+    """
+
+    def setUp(self):
+        import dtcc
+        self.dtcc = dtcc
+        self.cfg = {"cc": {"poll_interval": 2}}
+        self.claimed, self.consumed = [], []
+        self._orig = {k: getattr(dtcc, k) for k in
+                      ("collect", "claim", "consume", "advance_cursor",
+                       "logline", "get_cursor")}
+        dtcc.claim = lambda mid, sid: (self.claimed.append((mid, sid)) or True)
+        dtcc.consume = lambda ids: self.consumed.extend(ids)
+        dtcc.advance_cursor = lambda newest, held: None
+        dtcc.logline = lambda *a, **k: None
+        dtcc.get_cursor = lambda cfg: ""
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            setattr(self.dtcc, k, v)
+
+    def _run(self, recs):
+        self.dtcc.collect = lambda cfg, since, bare: (recs, "")
+        return self.dtcc.wait_for_command(self.cfg, 0, False, since="", sid="e1e3")
+
+    def test_回声不当指令返回(self):
+        got = self._run([{"id": "m1", "time": "1", "text": 哨兵,
+                          "self_echo": True}])
+        self.assertIsNone(got, "自己推的【哨兵】摘要被当成他的指令注进会话了")
+
+    def test_回声要被消费掉否则游标过不去(self):
+        self._run([{"id": "m1", "time": "1", "text": 哨兵, "self_echo": True}])
+        self.assertIn("m1", self.consumed,
+                      "只 continue 不 consume，同一条会每轮重新识别一次")
+
+    def test_他真打的话照样送到(self):
+        """反方向的漏事：误杀他的指令，比多干一次活糟得多。"""
+        got = self._run([{"id": "m2", "time": "1", "text": "把 demo 推一下",
+                          "self_echo": False}])
+        self.assertIsNotNone(got, "他自己打的话被吞了")
+        self.assertEqual(got["text"], "把 demo 推一下")
+
+    def test_没有self_echo字段时按他的话走(self):
+        """`collect` 拿不到判据时会把标记留空（见它那段兜底注释）。
+        那种情况必须**退回老行为**（当指令），不能反过来一律吞掉。"""
+        got = self._run([{"id": "m3", "time": "1", "text": "测试回路"}])
+        self.assertIsNotNone(got)
+
+    def test_回声和真指令混在一批里只送真的(self):
+        got = self._run([
+            {"id": "m1", "time": "1", "text": 哨兵, "self_echo": True},
+            {"id": "m2", "time": "2", "text": "这条帮我办了", "self_echo": False},
+        ])
+        self.assertIsNotNone(got)
+        self.assertEqual(got["text"], "这条帮我办了")
+        self.assertIn("m1", self.consumed)
