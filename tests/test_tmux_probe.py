@@ -96,6 +96,17 @@ class CtxUsage(unittest.TestCase):
     def test_百分比但没有k不算(self):
         self.assertIsNone(tp.parse_ctx_usage("进度 53% 完成"))
 
+    def test_先读pane选项(self):
+        """页脚那行挪到 tmux 底栏以后，数在 pane 选项 @claude_ctx 里，屏幕上没有。"""
+        p = tp.PaneProbe("%1", screen_source=tp.FakeScreen(
+            frames=[screen("❯ ", "  ⏵⏵ auto mode on")],
+            options={("%1", "@claude_ctx"): "34% (336k)"}))
+        self.assertEqual(p.ctx_usage(), "336k (34%)")
+
+    def test_没有选项就回退到页脚(self):
+        p = tp.PaneProbe("%1", screen_source=tp.FakeScreen(frames=[FOOTER]))
+        self.assertEqual(p.ctx_usage(), "529k (53%)")
+
 
 class Tail(unittest.TestCase):
     def test_不受可见区高度影响(self):

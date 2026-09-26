@@ -166,6 +166,7 @@ class ScreenSource(Protocol):
     def send_enter(self, pane: str) -> bool: ...
     def alive(self, pane: str) -> bool: ...
     def live_panes(self) -> set: ...
+    def pane_option(self, pane: str, name: str) -> str: ...
 
 
 def _sh(args: Sequence[str], timeout: float = 5) -> Tuple[int, str]:
@@ -210,6 +211,12 @@ class TmuxScreen(object):
         code, out = _sh(["tmux", "list-panes", "-a", "-F", "#{pane_id}"])
         return set(out.split()) if code == 0 else set()
 
+    def pane_option(self, pane, name):
+        if not is_pane_id(pane):
+            return ""
+        code, out = _sh(["tmux", "show", "-pqv", "-t", pane, name])
+        return out if code == 0 else ""
+
 
 class FakeScreen(object):
     """假实现。**测试里唯一该用的东西**，不碰 tmux、不碰时钟。
@@ -225,8 +232,10 @@ class FakeScreen(object):
     断言逼出来的，所以这里连时钟都不给真的。
     """
 
-    def __init__(self, frames=None, alive_panes=None, send_ok=True, enter_ok=True):
+    def __init__(self, frames=None, alive_panes=None, send_ok=True, enter_ok=True,
+                 options=None):
         self.frames = list(frames or [""])
+        self.options = dict(options or {})     # {(pane, "@name"): value}
         self.alive_panes = alive_panes
         self.send_ok = send_ok
         self.enter_ok = enter_ok
@@ -261,6 +270,9 @@ class FakeScreen(object):
 
     def live_panes(self):
         return set(self.alive_panes or [])
+
+    def pane_option(self, pane, name):
+        return self.options.get((pane, name), "")
 
 
 # ---------------------------------------------------------------- 探针
@@ -311,7 +323,16 @@ class PaneProbe(object):
         return parse_awaiting_choice(self.tail())
 
     def ctx_usage(self):
-        return parse_ctx_usage(self.tail())
+        """先读 pane 选项 `@claude_ctx`，读不到再抓页脚。
+
+        在 tmux 里，statusline 脚本（dotfiles 的 claude/statusline.sh）不再在
+        Claude 窗口里画那一行，而是把 "53% (529k)" 写进这个 pane 的 `@claude_ctx`，
+        显示挪到了 tmux 底栏 —— 页脚上已经没有这个数了。格式跟原来页脚里那段一样，
+        所以同一个 parse_ctx_usage 两边都能解析。抓屏留作兜底：没装新脚本的机器
+        上页脚还在。
+        """
+        opt = parse_ctx_usage(self.screen.pane_option(self.pane, "@claude_ctx"))
+        return opt if opt else parse_ctx_usage(self.tail())
 
     def alive(self):
         return self.screen.alive(self.pane)
